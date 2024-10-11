@@ -106,6 +106,13 @@ MESON_LLVM_VERSION := $(LLVM_VERSION_MAJOR).0.0
 LOCAL_SHARED_LIBRARIES += libLLVM$(LLVM_VERSION_MAJOR)
 endif
 
+ifneq ($(strip $(BOARD_MESA3D_GALLIUM_VA)),)
+LIBVA_MAJOR_VERSION = 1
+LIBVA_MINOR_VERSION = 20
+LOCAL_SHARED_LIBRARIES += libva
+MESON_GEN_PKGCONFIGS += libva:$(LIBVA_MAJOR_VERSION).$(LIBVA_MINOR_VERSION)
+endif
+
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 30; echo $$?), 0)
 LOCAL_SHARED_LIBRARIES += \
     android.hardware.graphics.mapper@4.0 \
@@ -145,6 +152,7 @@ endif
 # $2: subdir
 # $3: source prebuilt
 # $4: export headers
+# $5: depend libs
 define mesa3d-lib
 include $(CLEAR_VARS)
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
@@ -155,9 +163,9 @@ LOCAL_PREBUILT_MODULE_FILE := $($3)
 LOCAL_MULTILIB := first
 LOCAL_CHECK_ELF_FILES := false
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SHARED_LIBRARIES := $(__MY_SHARED_LIBRARIES)
 LOCAL_EXPORT_C_INCLUDE_DIRS := $4
-include $(BUILD_PREBUILT)
+LOCAL_SHARED_LIBRARIES := $(__MY_SHARED_LIBRARIES) $5
+include $(BUILD_SHARED_LIBRARY)
 
 ifdef TARGET_2ND_ARCH
 include $(CLEAR_VARS)
@@ -169,9 +177,9 @@ LOCAL_PREBUILT_MODULE_FILE := $(2ND_$3)
 LOCAL_MULTILIB := 32
 LOCAL_CHECK_ELF_FILES := false
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SHARED_LIBRARIES := $(__MY_SHARED_LIBRARIES)
 LOCAL_EXPORT_C_INCLUDE_DIRS := $4
-include $(BUILD_PREBUILT)
+LOCAL_SHARED_LIBRARIES := $(__MY_SHARED_LIBRARIES) $5
+include $(BUILD_SHARED_LIBRARY)
 endif
 endef
 
@@ -181,7 +189,13 @@ ifneq ($(strip $(BOARD_MESA3D_GALLIUM_DRIVERS)),)
 $(eval $(call mesa3d-lib,libgallium_dri,,MESA3D_GALLIUM_BIN))
 # Module 'libglapi', produces '/vendor/lib{64}/libglapi.so'
 $(eval $(call mesa3d-lib,libglapi,,MESA3D_LIBGLAPI_BIN))
-
+# Module 'libgallium_dri', produces '/vendor/lib{64}/dri/{driver_name}_drv_video.so'
+ifneq ($(strip $(BOARD_MESA3D_GALLIUM_VA)),)
+# nouveau, radeonsi, virtio_gpu
+$(eval $(call mesa3d-lib,nouveau_drv_video,dri,,,libgallium_dri))
+$(eval $(call mesa3d-lib,radeonsi_drv_video,dri,,,libgallium_dri))
+$(eval $(call mesa3d-lib,virtio_gpu_drv_video,dri,,,libgallium_dri))
+endif
 # Module 'libGLES_mesa', produces '/vendor/lib{64}/egl/libGLES_mesa.so' as copy of 'libEGL_mesa'
 $(eval $(call mesa3d-lib,libGLES_mesa,egl,MESA3D_LIBEGL_BIN))
 # Modules 'libgallium_dri' and 'libglapi' are installed even if not listed in PRODUCT_PACKAGES
