@@ -21,7 +21,7 @@
 #include <ctype.h>
 
 #define AMDGPU_MI100_RANGE       0x32, 0x3C
-#define AMDGPU_MI200_RANGE       0x3C, 0xFF
+#define AMDGPU_MI200_RANGE       0x3C, 0x46
 #define AMDGPU_GFX940_RANGE      0x46, 0xFF
 
 #define ASICREV_IS_MI100(r)      ASICREV_IS(r, MI100)
@@ -345,6 +345,11 @@ static const char *amdgpu_get_marketing_name(amdgpu_device_handle dev)
 static intptr_t readlink(const char *path, char *buf, size_t bufsiz)
 {
    return -1;
+}
+static char *
+drmGetFormatModifierName(uint64_t modifier)
+{
+   return NULL;
 }
 #else
 #include "drm-uapi/amdgpu_drm.h"
@@ -1087,6 +1092,12 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->uses_kernel_cu_mask = false; /* Not implemented in the kernel. */
    info->has_graphics = info->ip[AMD_IP_GFX].num_queues > 0;
 
+   /* On GFX8, the TBA/TMA registers can be configured from the userspace.
+    * On GFX9+, they are privileged registers and they need to be configured
+    * from the kernel but it's not suppported yet.
+    */
+   info->has_trap_handler_support = info->gfx_level == GFX8;
+
    info->pa_sc_tile_steering_override = device_info.pa_sc_tile_steering_override;
    info->max_render_backends = device_info.num_rb_pipes;
    /* The value returned by the kernel driver was wrong. */
@@ -1229,8 +1240,14 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->has_dcc_constant_encode =
       info->family == CHIP_RAVEN2 || info->family == CHIP_RENOIR || info->gfx_level >= GFX10;
 
-   /* TC-compat HTILE is only available for GFX8-GFX11.5. */
-   info->has_tc_compatible_htile = info->gfx_level >= GFX8 && info->gfx_level < GFX12;
+   /* TC-compat HTILE is only available on GFX8-GFX11.5.
+    *
+    * There are issues with TC-compatible HTILE on Tonga (and Iceland is the same design), and
+    * documented bug workarounds don't help. For example, this fails:
+    *   piglit/bin/tex-miplevel-selection 'texture()' 2DShadow -auto
+    */
+   info->has_tc_compatible_htile = info->gfx_level >= GFX8 && info->gfx_level < GFX12 &&
+                                   info->family != CHIP_TONGA && info->family != CHIP_ICELAND;
 
    info->has_etc_support = info->family == CHIP_STONEY || info->family == CHIP_VEGA10 ||
                            info->family == CHIP_RAVEN || info->family == CHIP_RAVEN2;
@@ -2005,6 +2022,7 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    }
 
    fprintf(f, "    has_tmz_support = %u\n", info->has_tmz_support);
+   fprintf(f, "    has_trap_handler_support = %u\n", info->has_trap_handler_support);
    for (unsigned i = 0; i < AMD_NUM_IP_TYPES; i++) {
       if (info->max_submitted_ibs[i]) {
          fprintf(f, "    IP %-7s max_submitted_ibs = %u\n", ac_get_ip_type_string(info, i),
@@ -2109,6 +2127,27 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
               G_0098F8_MULTI_GPU_TILE_SIZE(info->gb_addr_config));
       fprintf(f, "    row_size = %u\n", 1024 << G_0098F8_ROW_SIZE(info->gb_addr_config));
       fprintf(f, "    num_lower_pipes = %u (raw)\n", G_0098F8_NUM_LOWER_PIPES(info->gb_addr_config));
+   }
+
+   struct ac_modifier_options modifier_options = {
+      .dcc = true,
+      .dcc_retile = true,
+   };
+   uint64_t modifiers[256];
+   unsigned modifier_count = ARRAY_SIZE(modifiers);
+
+   /* Get the number of modifiers. */
+   if (ac_get_supported_modifiers(info, &modifier_options, PIPE_FORMAT_R8G8B8A8_UNORM,
+                                  &modifier_count, modifiers)) {
+      if (modifier_count)
+         fprintf(f, "Modifiers (32bpp):\n");
+
+      for (unsigned i = 0; i < modifier_count; i++) {
+         char *name = drmGetFormatModifierName(modifiers[i]);
+
+         fprintf(f, "    %s\n", name);
+         free(name);
+      }
    }
 }
 

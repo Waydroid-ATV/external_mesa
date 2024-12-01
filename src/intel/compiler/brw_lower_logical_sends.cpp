@@ -289,6 +289,7 @@ lower_fb_write_logical_send(const fs_builder &bld, fs_inst *inst,
                             const fs_thread_payload &fs_payload)
 {
    assert(inst->src[FB_WRITE_LOGICAL_SRC_COMPONENTS].file == IMM);
+   assert(inst->src[FB_WRITE_LOGICAL_SRC_NULL_RT].file == IMM);
    const intel_device_info *devinfo = bld.shader->devinfo;
    const brw_reg color0 = inst->src[FB_WRITE_LOGICAL_SRC_COLOR0];
    const brw_reg color1 = inst->src[FB_WRITE_LOGICAL_SRC_COLOR1];
@@ -299,6 +300,7 @@ lower_fb_write_logical_send(const fs_builder &bld, fs_inst *inst,
    brw_reg sample_mask = inst->src[FB_WRITE_LOGICAL_SRC_OMASK];
    const unsigned components =
       inst->src[FB_WRITE_LOGICAL_SRC_COMPONENTS].ud;
+   const bool null_rt = inst->src[FB_WRITE_LOGICAL_SRC_NULL_RT].ud != 0;
 
    assert(inst->target != 0 || src0_alpha.file == BAD_FILE);
 
@@ -482,7 +484,7 @@ lower_fb_write_logical_send(const fs_builder &bld, fs_inst *inst,
    uint32_t ex_desc = 0;
    if (devinfo->ver >= 20) {
       ex_desc = inst->target << 21 |
-                (key->nr_color_regions == 0) << 20 |
+                null_rt << 20 |
                 (src0_alpha.file != BAD_FILE) << 15 |
                 (src_stencil.file != BAD_FILE) << 14 |
                 (src_depth.file != BAD_FILE) << 13 |
@@ -491,10 +493,9 @@ lower_fb_write_logical_send(const fs_builder &bld, fs_inst *inst,
       /* Set the "Render Target Index" and "Src0 Alpha Present" fields
        * in the extended message descriptor, in lieu of using a header.
        */
-      ex_desc = inst->target << 12 | (src0_alpha.file != BAD_FILE) << 15;
-
-      if (key->nr_color_regions == 0)
-         ex_desc |= 1 << 20; /* Null Render Target */
+      ex_desc = inst->target << 12 |
+                null_rt << 20 |
+                (src0_alpha.file != BAD_FILE) << 15;
    }
    inst->ex_desc = ex_desc;
 
@@ -750,6 +751,9 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
                            unsigned grad_components,
                            bool residency)
 {
+   /* We never generate EOT sampler messages */
+   assert(!inst->eot);
+
    const brw_compiler *compiler = bld.shader->compiler;
    const intel_device_info *devinfo = bld.shader->devinfo;
    const enum brw_reg_type payload_type =
@@ -758,7 +762,6 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
       brw_type_with_size(BRW_TYPE_UD, payload_type_bit_size);
    const enum brw_reg_type payload_signed_type =
       brw_type_with_size(BRW_TYPE_D, payload_type_bit_size);
-   unsigned reg_width = bld.dispatch_width() / 8;
    unsigned header_size = 0, length = 0;
    opcode op = inst->opcode;
    brw_reg sources[1 + MAX_SAMPLER_MESSAGE_SIZE];
@@ -769,7 +772,7 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
    assert((surface.file == BAD_FILE) != (surface_handle.file == BAD_FILE));
    assert((sampler.file == BAD_FILE) != (sampler_handle.file == BAD_FILE));
 
-   if (shader_opcode_needs_header(op) || inst->offset != 0 || inst->eot ||
+   if (shader_opcode_needs_header(op) || inst->offset != 0 ||
        sampler_handle.file != BAD_FILE ||
        is_high_sampler(devinfo, sampler) ||
        residency) {
@@ -789,10 +792,15 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
        * and we have an explicit header, we need to set up the sampler
        * writemask.  It's reversed from normal: 1 means "don't write".
        */
-      unsigned reg_count = regs_written(inst) - reg_unit(devinfo) * residency;
-      if (!inst->eot && reg_count < 4 * reg_width) {
-         assert(reg_count % reg_width == 0);
-         unsigned mask = ~((1 << (reg_count / reg_width)) - 1) & 0xf;
+      unsigned comps_regs =
+         DIV_ROUND_UP(regs_written(inst) - reg_unit(devinfo) * residency,
+                      reg_unit(devinfo));
+      unsigned comp_regs =
+         DIV_ROUND_UP(inst->dst.component_size(inst->exec_size),
+                      reg_unit(devinfo) * REG_SIZE);
+      if (comps_regs < 4 * comp_regs) {
+         assert(comps_regs % comp_regs == 0);
+         unsigned mask = ~((1 << (comps_regs / comp_regs)) - 1) & 0xf;
          inst->offset |= mask << 12;
       }
 
@@ -1087,7 +1095,7 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
    }
 
    const brw_reg src_payload =
-      brw_vgrf(bld.shader->alloc.allocate(length * reg_width),
+      brw_vgrf(bld.shader->alloc.allocate(length * bld.dispatch_width() / 8),
                BRW_TYPE_F);
    /* In case of 16-bit payload each component takes one full register in
     * both SIMD8H and SIMD16H modes. In both cases one reg can hold 16
@@ -1194,16 +1202,6 @@ lower_sampler_logical_send(const fs_builder &bld, fs_inst *inst,
 
    inst->src[2] = src_payload;
    inst->resize_sources(3);
-
-   if (inst->eot) {
-      /* EOT sampler messages don't make sense to split because it would
-       * involve ending half of the thread early.
-       */
-      assert(inst->group == 0);
-      /* We need to use SENDC for EOT sampler messages */
-      inst->check_tdr = true;
-      inst->send_has_side_effects = true;
-   }
 
    /* Message length > MAX_SAMPLER_MESSAGE_SIZE disallowed by hardware. */
    assert(inst->mlen <= MAX_SAMPLER_MESSAGE_SIZE * reg_unit(devinfo));
@@ -1544,6 +1542,19 @@ lower_lsc_memory_logical_send(const fs_builder &bld, fs_inst *inst)
       break;
    }
    assert(inst->sfid);
+
+   /* Disable LSC data port L1 cache scheme for the TGM load/store for RT
+    * shaders. (see HSD 18038444588)
+    */
+   if (devinfo->ver >= 20 && gl_shader_stage_is_rt(bld.shader->stage) &&
+       inst->sfid == GFX12_SFID_TGM &&
+       !lsc_opcode_is_atomic(op)) {
+      if (lsc_opcode_is_store(op)) {
+         cache_mode = (unsigned) LSC_CACHE(devinfo, STORE, L1UC_L3WB);
+      } else {
+         cache_mode = (unsigned) LSC_CACHE(devinfo, LOAD, L1UC_L3C);
+      }
+   }
 
    inst->desc = lsc_msg_desc(devinfo, op, binding_type, addr_size, data_size,
                              lsc_opcode_has_cmask(op) ?

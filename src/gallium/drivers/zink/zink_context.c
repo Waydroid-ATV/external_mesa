@@ -971,7 +971,7 @@ create_bvci(struct zink_context *ctx, struct zink_resource *res, enum pipe_forma
    memset(&bvci, 0, sizeof(bvci));
    bvci.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
    bvci.pNext = NULL;
-   if (screen->format_props[format].bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)
+   if (zink_get_format_props(screen, format)->bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)
       bvci.buffer = res->obj->storage_buffer ? res->obj->storage_buffer : res->obj->buffer;
    else
       bvci.buffer = res->obj->buffer;
@@ -986,7 +986,7 @@ create_bvci(struct zink_context *ctx, struct zink_resource *res, enum pipe_forma
       if (bvci.offset + bvci.range >= res->base.b.width0)
          bvci.range = VK_WHOLE_SIZE;
    }
-   uint64_t clamp = blocksize * screen->info.props.limits.maxTexelBufferElements;
+   uint64_t clamp = (uint64_t)blocksize * (uint64_t)screen->info.props.limits.maxTexelBufferElements;
    if (bvci.range == VK_WHOLE_SIZE && res->base.b.width0 > clamp)
       bvci.range = clamp;
    bvci.flags = 0;
@@ -1140,7 +1140,7 @@ zink_create_sampler_view(struct pipe_context *pctx, struct pipe_resource *pres,
 
       ivci = create_ivci(screen, res, &templ, state->target);
       ivci.subresourceRange.levelCount = state->u.tex.last_level - state->u.tex.first_level + 1;
-      ivci.subresourceRange.aspectMask = sampler_aspect_from_format(state->format);
+      ivci.subresourceRange.aspectMask = util_format_is_depth_or_stencil(state->format) ? sampler_aspect_from_format(state->format) : res->aspect;
       bool red_depth_sampler_view = false;
       /* samplers for stencil aspects of packed formats need to always use stencil swizzle */
       if (ivci.subresourceRange.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
@@ -4036,20 +4036,20 @@ zink_flush(struct pipe_context *pctx,
 
    bool has_work = ctx->bs->has_work | ctx->bs->has_reordered_work | ctx->bs->has_unsync;
    if (!has_work) {
-       if (pfence) {
-          /* reuse last fence */
-          bs = ctx->last_batch_state;
-       }
-       if (!deferred) {
-          struct zink_batch_state *last = ctx->last_batch_state;
-          if (last) {
-             sync_flush(ctx, last);
-             if (last->is_device_lost)
-                check_device_lost(ctx);
-          }
-       }
-       if (ctx->tc && !ctx->track_renderpasses)
-         tc_driver_internal_flush_notify(ctx->tc);
+      if (pfence) {
+         /* reuse last fence */
+         bs = ctx->last_batch_state;
+      }
+      if (!deferred) {
+         struct zink_batch_state *last = ctx->last_batch_state;
+         if (last) {
+            sync_flush(ctx, last);
+            if (last->is_device_lost)
+               check_device_lost(ctx);
+         }
+      }
+      if (ctx->tc && !ctx->track_renderpasses)
+      tc_driver_internal_flush_notify(ctx->tc);
    } else {
       bs = ctx->bs;
       if (deferred && !(flags & PIPE_FLUSH_FENCE_FD) && pfence)

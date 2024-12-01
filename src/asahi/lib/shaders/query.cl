@@ -10,9 +10,6 @@
 static inline void
 write_query_result(uintptr_t dst_addr, int32_t idx, bool is_64, uint64_t result)
 {
-   /* TODO: do we want real 64-bit stats? sync with CPU impl */
-   result &= 0xffffffff;
-
    if (is_64) {
       global uint64_t *out = (global uint64_t *)dst_addr;
       out[idx] = result;
@@ -108,4 +105,10 @@ libagx_increment_ia_counters(constant struct libagx_increment_ia_counters *p,
    if (p->vs_invocations) {
       *(p->vs_invocations) += count;
    }
+}
+
+void
+libagx_write_u32s(constant struct libagx_imm_write *p, uint id)
+{
+   *(p[id].address) = p[id].value;
 }

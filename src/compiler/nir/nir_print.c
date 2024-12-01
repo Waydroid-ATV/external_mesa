@@ -129,7 +129,7 @@ print_def(nir_def *def, print_state *state)
 
    const unsigned ssa_padding = state->max_dest_index ? count_digits(state->max_dest_index) - count_digits(def->index) : 0;
 
-   const unsigned padding = (def->bit_size == 1) + 1 + ssa_padding;
+   const unsigned padding = (def->bit_size <= 8) + 1 + ssa_padding;
 
    fprintf(fp, "%s%u%s%*s%s%u",
            divergence_status(state, def->divergent),
@@ -1607,6 +1607,11 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          break;
       }
 
+      case NIR_INTRINSIC_INTERP_MODE:
+         fprintf(fp, "interp_mode=%s",
+                 glsl_interp_mode_name(nir_intrinsic_interp_mode(instr)));
+         break;
+
       default: {
          unsigned off = info->index_map[idx] - 1;
          fprintf(fp, "%s=%d", nir_intrinsic_index_names[idx], instr->const_index[off]);
@@ -2209,7 +2214,7 @@ print_loop(nir_loop *loop, print_state *state, unsigned tabs)
    FILE *fp = state->fp;
 
    print_indentation(tabs, fp);
-   fprintf(fp, "%sloop {\n", divergence_status(state, loop->divergent));
+   fprintf(fp, "%sloop {\n", divergence_status(state, loop->divergent_break));
    foreach_list_typed(nir_cf_node, node, node, &loop->body) {
       print_cf_node(node, state, tabs + 1);
    }
@@ -2558,7 +2563,6 @@ print_shader_info(const struct shader_info *info, FILE *fp)
 
    print_nz_bool(fp, "uses_texture_gather", info->uses_texture_gather);
    print_nz_bool(fp, "uses_resource_info_query", info->uses_resource_info_query);
-   print_nz_bool(fp, "uses_fddx_fddy", info->uses_fddx_fddy);
    print_nz_bool(fp, "divergence_analysis_run", info->divergence_analysis_run);
 
    print_nz_x8(fp, "bit_sizes_float", info->bit_sizes_float);
@@ -2588,6 +2592,8 @@ print_shader_info(const struct shader_info *info, FILE *fp)
 
       print_nz_bool(fp, "ccw", info->tess.ccw);
       print_nz_bool(fp, "point_mode", info->tess.point_mode);
+      print_nz_x64(fp, "tcs_same_invocation_inputs_read",
+                   info->tess.tcs_same_invocation_inputs_read);
       print_nz_x64(fp, "tcs_cross_invocation_inputs_read", info->tess.tcs_cross_invocation_inputs_read);
       print_nz_x64(fp, "tcs_cross_invocation_outputs_read", info->tess.tcs_cross_invocation_outputs_read);
       break;

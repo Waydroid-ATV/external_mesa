@@ -138,6 +138,7 @@ private:
                               unsigned align_offset,
                               unsigned bit_size,
                               unsigned num_components,
+                              unsigned hole_size,
                               nir_intrinsic_instr *low,
                               nir_intrinsic_instr *high,
                               void *cb_data);
@@ -1369,10 +1370,14 @@ Converter::memVectorizeCb(unsigned align_mul,
                           unsigned align_offset,
                           unsigned bit_size,
                           unsigned num_components,
+                          unsigned hole_size,
                           nir_intrinsic_instr *low,
                           nir_intrinsic_instr *high,
                           void *cb_data)
 {
+   if (hole_size)
+      return false;
+
    /*
     * Since we legalize these later with nir_lower_mem_access_bit_sizes,
     * we can optimistically combine anything that might be profitable
@@ -3146,7 +3151,7 @@ Converter::visit(nir_tex_instr *insn)
       if (lodIdx != -1 && !target.isMS())
          srcs.push_back(getSrc(&insn->src[lodIdx].src, 0));
       else if (op == OP_TXQ)
-         srcs.push_back(zero); // TXQ always needs an LOD
+         srcs.push_back(loadImm(NULL, 0)); // TXQ always needs an LOD
       else if (op == OP_TXF)
          lz = true;
       if (msIdx != -1)

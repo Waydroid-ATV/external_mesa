@@ -93,6 +93,7 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
    }
 
    cs->current = out;
+   cs->stats.flushes++;
 }
 
 /*
@@ -110,11 +111,17 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
    assert(cs->current + 0x2000 < cs->end && "should have ensured space");
    uint8_t *out = cs->current;
 
+   cs->stats.cmds++;
+
    agx_push(out, CDM_LAUNCH_WORD_0, cfg) {
-      if (grid.indirect)
-         cfg.mode = AGX_CDM_MODE_INDIRECT_GLOBAL;
-      else
+      if (grid.indirect) {
+         if (grid.indirect_local)
+            cfg.mode = AGX_CDM_MODE_INDIRECT_LOCAL;
+         else
+            cfg.mode = AGX_CDM_MODE_INDIRECT_GLOBAL;
+      } else {
          cfg.mode = AGX_CDM_MODE_DIRECT;
+      }
 
       /* For now, always bind the txf sampler and nothing else */
       cfg.sampler_state_register_count = 1;
@@ -150,10 +157,12 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       }
    }
 
-   agx_push(out, CDM_LOCAL_SIZE, cfg) {
-      cfg.x = local_size.count[0];
-      cfg.y = local_size.count[1];
-      cfg.z = local_size.count[2];
+   if (!grid.indirect_local) {
+      agx_push(out, CDM_LOCAL_SIZE, cfg) {
+         cfg.x = local_size.count[0];
+         cfg.y = local_size.count[1];
+         cfg.z = local_size.count[2];
+      }
    }
 
    cs->current = out;
@@ -190,11 +199,13 @@ dispatch(struct hk_cmd_buffer *cmd, struct hk_grid grid)
       uint32_t usc =
          hk_upload_usc_words_kernel(cmd, s, &params, sizeof(params));
 
+      perf_debug(dev, "CS invocation statistic");
       hk_dispatch_with_usc(dev, cs, s, usc, hk_grid(1, 1, 1), hk_grid(1, 1, 1));
    }
 
    hk_ensure_cs_has_space(cmd, cs, 0x2000 /* TODO */);
    hk_dispatch(cmd, cs, s, grid);
+   cs->stats.calls++;
 }
 
 VKAPI_ATTR void VKAPI_CALL

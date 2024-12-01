@@ -498,16 +498,6 @@ brw_alu2(struct brw_codegen *p, unsigned opcode,
    return insn;
 }
 
-static int
-get_3src_subreg_nr(struct brw_reg reg)
-{
-   /* Normally, SubRegNum is in bytes (0..31).  However, 3-src instructions
-    * use 32-bit units (components 0..7).  Since they only support F/D/UD
-    * types, this doesn't lose any flexibility, but uses fewer bits.
-    */
-   return reg.subnr / 4;
-}
-
 static enum gfx10_align1_3src_vertical_stride
 to_3src_align1_vstride(const struct intel_device_info *devinfo,
                        enum brw_vertical_stride vstride)
@@ -558,9 +548,27 @@ brw_alu3(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
 
    assert(dest.nr < XE2_MAX_GRF);
 
-   if (devinfo->ver >= 10)
-      assert(!(src0.file == IMM &&
-               src2.file == IMM));
+   if (devinfo->ver <= 9) {
+      assert(src0.file != IMM && src2.file != IMM);
+   } else if (devinfo->ver <= 11) {
+      /* On Ice Lake, BFE and CSEL cannot have any immediate sources. */
+      assert((opcode != BRW_OPCODE_BFE && opcode != BRW_OPCODE_CSEL) ||
+             (src0.file != IMM && src2.file != IMM));
+
+      /* On Ice Lake, DP4A and MAD can only have one immediate source. */
+      assert((opcode != BRW_OPCODE_DP4A && opcode != BRW_OPCODE_MAD) ||
+             !(src0.file == IMM && src2.file == IMM));
+   } else {
+      /* Having two immediate sources is allowed, but this should have been
+       * converted to a regular ADD by brw_fs_opt_algebraic.
+       */
+      assert(opcode == BRW_OPCODE_ADD3 ||
+             !(src0.file == IMM && src2.file == IMM));
+   }
+
+   /* BFI2 cannot have any immediate sources on any platform. */
+   assert(opcode != BRW_OPCODE_BFI2 ||
+          (src0.file != IMM && src2.file != IMM));
 
    assert(src0.file == IMM || src0.nr < XE2_MAX_GRF);
    assert(src1.file != IMM && src1.nr < XE2_MAX_GRF);
@@ -672,7 +680,7 @@ brw_alu3(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
 
       assert(src0.file == FIXED_GRF);
       brw_inst_set_3src_a16_src0_swizzle(devinfo, inst, src0.swizzle);
-      brw_inst_set_3src_a16_src0_subreg_nr(devinfo, inst, get_3src_subreg_nr(src0));
+      brw_inst_set_3src_a16_src0_subreg_nr(devinfo, inst, src0.subnr);
       brw_inst_set_3src_src0_reg_nr(devinfo, inst, src0.nr);
       brw_inst_set_3src_src0_abs(devinfo, inst, src0.abs);
       brw_inst_set_3src_src0_negate(devinfo, inst, src0.negate);
@@ -681,7 +689,7 @@ brw_alu3(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
 
       assert(src1.file == FIXED_GRF);
       brw_inst_set_3src_a16_src1_swizzle(devinfo, inst, src1.swizzle);
-      brw_inst_set_3src_a16_src1_subreg_nr(devinfo, inst, get_3src_subreg_nr(src1));
+      brw_inst_set_3src_a16_src1_subreg_nr(devinfo, inst, src1.subnr);
       brw_inst_set_3src_src1_reg_nr(devinfo, inst, src1.nr);
       brw_inst_set_3src_src1_abs(devinfo, inst, src1.abs);
       brw_inst_set_3src_src1_negate(devinfo, inst, src1.negate);
@@ -690,7 +698,7 @@ brw_alu3(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
 
       assert(src2.file == FIXED_GRF);
       brw_inst_set_3src_a16_src2_swizzle(devinfo, inst, src2.swizzle);
-      brw_inst_set_3src_a16_src2_subreg_nr(devinfo, inst, get_3src_subreg_nr(src2));
+      brw_inst_set_3src_a16_src2_subreg_nr(devinfo, inst, src2.subnr);
       brw_inst_set_3src_src2_reg_nr(devinfo, inst, src2.nr);
       brw_inst_set_3src_src2_abs(devinfo, inst, src2.abs);
       brw_inst_set_3src_src2_negate(devinfo, inst, src2.negate);

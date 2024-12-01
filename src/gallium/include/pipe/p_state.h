@@ -56,6 +56,8 @@
 extern "C" {
 #endif
 
+struct nir_shader;
+
 /**
  * Implementation limits
  */
@@ -301,7 +303,7 @@ struct pipe_shader_state
    const struct tgsi_token *tokens;
    union {
       void *native;
-      void *nir;
+      struct nir_shader *nir;
    } ir;
    struct pipe_stream_output_info stream_output;
 };
@@ -854,8 +856,7 @@ struct pipe_draw_info
    /* sizeof(mode) == 1 is required by draw merging in u_threaded_context. */
    uint8_t mode;              /**< the mode of the primitive */
 #endif
-   uint8_t index_size;        /**< if 0, the draw is not indexed. */
-   uint8_t view_mask;         /**< mask of multiviews for this draw */
+   uint16_t index_size;        /**< if 0, the draw is not indexed. */
    bool primitive_restart:1;
    bool has_user_indices:1;   /**< if true, use index.user_buffer */
    bool index_bounds_valid:1; /**< whether min_index and max_index are valid;

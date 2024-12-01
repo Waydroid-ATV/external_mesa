@@ -825,9 +825,8 @@ try_copy_propagate(const brw_compiler *compiler, fs_inst *inst,
     * destination of the copy, and simply replacing the sources would give a
     * program with different semantics.
     */
-   if ((brw_type_size_bits(entry->dst.type) < brw_type_size_bits(inst->src[arg].type) ||
-        entry->is_partial_write) &&
-       inst->opcode != BRW_OPCODE_MOV) {
+   if (brw_type_size_bits(entry->dst.type) < brw_type_size_bits(inst->src[arg].type) ||
+       (entry->is_partial_write && inst->opcode != BRW_OPCODE_MOV)) {
       return false;
    }
 
@@ -1318,7 +1317,7 @@ opt_copy_propagation_local(const brw_compiler *compiler, linear_ctx *lin_ctx,
 
    foreach_inst_in_block(fs_inst, inst, block) {
       /* Try propagating into this instruction. */
-      bool instruction_progress = false;
+      bool constant_progress = false;
       for (int i = inst->sources - 1; i >= 0; i--) {
          if (inst->src[i].file != VGRF)
             continue;
@@ -1328,22 +1327,23 @@ opt_copy_propagation_local(const brw_compiler *compiler, linear_ctx *lin_ctx,
               ++iter) {
             if ((*iter)->src.file == IMM) {
                if (try_constant_propagate(inst, *iter, i)) {
-                  instruction_progress = true;
+                  constant_progress = true;
                   break;
                }
             } else {
                if (try_copy_propagate(compiler, inst, *iter, i, alloc,
                                       max_polygons)) {
-                  instruction_progress = true;
+                  progress = true;
                   break;
                }
             }
          }
       }
 
-      if (instruction_progress) {
-         progress = true;
+      if (constant_progress) {
          commute_immediates(inst);
+         brw_constant_fold_instruction(compiler->devinfo, inst);
+         progress = true;
       }
 
       /* kill the destination from the ACP */
@@ -1505,8 +1505,7 @@ try_copy_propagate_def(const brw_compiler *compiler,
     * destination of the copy, and simply replacing the sources would give a
     * program with different semantics.
     */
-   if (inst->opcode != BRW_OPCODE_MOV &&
-       brw_type_size_bits(def->dst.type) <
+   if (brw_type_size_bits(def->dst.type) <
        brw_type_size_bits(inst->src[arg].type))
       return false;
 
@@ -1803,7 +1802,7 @@ brw_fs_opt_copy_propagation_defs(fs_visitor &s)
 
    foreach_block_and_inst_safe(block, fs_inst, inst, s.cfg) {
       /* Try propagating into this instruction. */
-      bool instruction_progress = false;
+      bool constant_progress = false;
 
       for (int i = inst->sources - 1; i >= 0; i--) {
          fs_inst *def = defs.get(inst->src[i]);
@@ -1822,7 +1821,7 @@ brw_fs_opt_copy_propagation_defs(fs_visitor &s)
                                          inst, i, s.max_polygons);
 
                if (source_progress) {
-                  instruction_progress = true;
+                  progress = true;
                   ++uses_deleted[def->dst.nr];
                   if (defs.get_use_count(def->dst) == uses_deleted[def->dst.nr])
                      def->remove(defs.get_block(def->dst), true);
@@ -1836,8 +1835,10 @@ brw_fs_opt_copy_propagation_defs(fs_visitor &s)
             find_value_for_offset(def, inst->src[i], inst->size_read(i));
 
          if (val.file == IMM) {
-            source_progress =
-               try_constant_propagate_def(def, val, inst, i);
+            if (try_constant_propagate_def(def, val, inst, i)) {
+               source_progress = true;
+               constant_progress = true;
+            }
          } else if (val.file == VGRF ||
                     val.file == ATTR || val.file == UNIFORM ||
                     (val.file == FIXED_GRF && val.is_contiguous())) {
@@ -1847,16 +1848,25 @@ brw_fs_opt_copy_propagation_defs(fs_visitor &s)
          }
 
          if (source_progress) {
-            instruction_progress = true;
+            progress = true;
             ++uses_deleted[def->dst.nr];
-            if (defs.get_use_count(def->dst) == uses_deleted[def->dst.nr])
+
+            /* We can copy propagate through an instruction like
+             *
+             *    mov.nz.f0.0(8) %2:D, -%78:D
+             *
+             * but deleting the instruction may alter the program.
+             */
+            if (def->conditional_mod == BRW_CONDITIONAL_NONE &&
+                defs.get_use_count(def->dst) == uses_deleted[def->dst.nr]) {
                def->remove(defs.get_block(def->dst), true);
+            }
          }
       }
 
-      if (instruction_progress) {
-         progress = true;
+      if (constant_progress) {
          commute_immediates(inst);
+         brw_constant_fold_instruction(s.compiler->devinfo, inst);
       }
    }
 

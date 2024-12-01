@@ -65,6 +65,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"noshadow",  AGX_DBG_NOSHADOW, "Force disable resource shadowing"},
    {"scratch",   AGX_DBG_SCRATCH,  "Debug scratch memory usage"},
    {"1queue",    AGX_DBG_1QUEUE,   "Force usage of a single queue for multiple contexts"},
+   {"nosoft",    AGX_DBG_NOSOFT,   "Disable soft fault optimizations"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -124,9 +125,6 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    struct agx_bo *bo;
    unsigned handle = 0;
 
-   assert(size > 0);
-   size = ALIGN_POT(size, dev->params.vm_page_size);
-
    /* executable implies low va */
    assert(!(flags & AGX_BO_EXEC) || (flags & AGX_BO_LOW_VA));
 
@@ -157,7 +155,7 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    assert(!memcmp(bo, &((struct agx_bo){}), sizeof(*bo)));
 
    bo->size = gem_create.size;
-   bo->align = MAX2(dev->params.vm_page_size, align);
+   bo->align = align;
    bo->flags = flags;
    bo->handle = handle;
    bo->prime_fd = -1;
@@ -382,7 +380,7 @@ agx_get_params(struct agx_device *dev, void *buf, size_t size)
 
 static int
 agx_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
-           uint32_t vbo_res_id)
+           struct agx_submit_virt *virt)
 {
    return drmIoctl(dev->fd, DRM_IOCTL_ASAHI_SUBMIT, submit);
 }
@@ -404,26 +402,31 @@ agx_open_device(void *memctx, struct agx_device *dev)
    dev->ops = agx_device_drm_ops;
 
    ssize_t params_size = -1;
-   drmVersionPtr version;
 
-   version = drmGetVersion(dev->fd);
-   if (!version) {
-      fprintf(stderr, "cannot get version: %s", strerror(errno));
-      return NULL;
-   }
+   /* DRM version check */
+   {
+      drmVersionPtr version = drmGetVersion(dev->fd);
+      if (!version) {
+         fprintf(stderr, "cannot get version: %s", strerror(errno));
+         return NULL;
+      }
 
-   if (!strcmp(version->name, "asahi")) {
-      dev->is_virtio = false;
-      dev->ops = agx_device_drm_ops;
-   } else if (!strcmp(version->name, "virtio_gpu")) {
-      dev->is_virtio = true;
-      if (!agx_virtio_open_device(dev)) {
-         fprintf(stderr,
-                 "Error opening virtio-gpu device for Asahi native context\n");
+      if (!strcmp(version->name, "asahi")) {
+         dev->is_virtio = false;
+         dev->ops = agx_device_drm_ops;
+      } else if (!strcmp(version->name, "virtio_gpu")) {
+         dev->is_virtio = true;
+         if (!agx_virtio_open_device(dev)) {
+            fprintf(
+               stderr,
+               "Error opening virtio-gpu device for Asahi native context\n");
+            return false;
+         }
+      } else {
          return false;
       }
-   } else {
-      return false;
+
+      drmFreeVersion(version);
    }
 
    params_size = dev->ops.get_params(dev, &dev->params, sizeof(dev->params));
@@ -495,12 +498,30 @@ agx_open_device(void *memctx, struct agx_device *dev)
             dev->params.gpu_generation, dev->params.gpu_variant,
             dev->params.gpu_revision + 0xA0);
 
+   /* We need a large chunk of VA space carved out for robustness. Hardware
+    * loads can shift an i32 by up to 2, for a total shift of 4. If the base
+    * address is zero, 36-bits is therefore enough to trap any zero-extended
+    * 32-bit index. For more generality we would need a larger carveout, but
+    * this is already optimal for VBOs.
+    *
+    * TODO: Maybe this should be on top instead? Might be ok.
+    */
+   uint64_t reservation = (1ull << 36);
+
    dev->guard_size = dev->params.vm_page_size;
    if (dev->params.vm_usc_start) {
       dev->shader_base = dev->params.vm_usc_start;
    } else {
       // Put the USC heap at the bottom of the user address space, 4GiB aligned
-      dev->shader_base = ALIGN_POT(dev->params.vm_user_start, 0x100000000ull);
+      dev->shader_base = ALIGN_POT(MAX2(dev->params.vm_user_start, reservation),
+                                   0x100000000ull);
+   }
+
+   if (dev->shader_base < reservation) {
+      /* Our robustness implementation requires the bottom unmapped */
+      fprintf(stderr, "Unexpected address layout, can't cope\n");
+      assert(0);
+      return false;
    }
 
    uint64_t shader_size = 0x100000000ull;
@@ -620,7 +641,8 @@ agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id)
       .queue_id = queue_id,
    };
 
-   return drmIoctl(dev->fd, DRM_IOCTL_ASAHI_QUEUE_DESTROY, &queue_destroy);
+   return asahi_simple_ioctl(dev, DRM_IOCTL_ASAHI_QUEUE_DESTROY,
+                             &queue_destroy);
 }
 
 int

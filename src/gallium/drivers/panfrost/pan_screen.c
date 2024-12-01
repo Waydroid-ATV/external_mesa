@@ -76,6 +76,7 @@ static const struct debug_named_value panfrost_debug_options[] = {
 #endif
    {"yuv",        PAN_DBG_YUV,      "Tint YUV textures with blue for 1-plane and green for 2-plane"},
    {"forcepack",  PAN_DBG_FORCE_PACK,  "Force packing of AFBC textures on upload"},
+   {"cs",         PAN_DBG_CS,       "Enable extra checks in command stream"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -96,6 +97,27 @@ static const char *
 panfrost_get_device_vendor(struct pipe_screen *screen)
 {
    return "Arm";
+}
+
+static int
+from_kmod_group_allow_priority_flags(
+   enum pan_kmod_group_allow_priority_flags kmod_flags)
+{
+   int flags = 0;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME)
+      flags |= PIPE_CONTEXT_PRIORITY_REALTIME;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_HIGH)
+      flags |= PIPE_CONTEXT_PRIORITY_HIGH;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM)
+      flags |= PIPE_CONTEXT_PRIORITY_MEDIUM;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW)
+      flags |= PIPE_CONTEXT_PRIORITY_LOW;
+
+   return flags;
 }
 
 static int
@@ -237,11 +259,11 @@ panfrost_get_param(struct pipe_screen *screen, enum pipe_cap param)
     * require element alignment for vertex buffers, using u_vbuf to
     * translate to match the hardware requirement.
     *
-    * This is less heavy-handed than the 4BYTE_ALIGNED_ONLY caps, which
+    * This is less heavy-handed than PIPE_VERTEX_INPUT_ALIGNMENT_4BYTE, which
     * would needlessly require alignment even for 8-bit formats.
     */
-   case PIPE_CAP_VERTEX_ATTRIB_ELEMENT_ALIGNED_ONLY:
-      return 1;
+   case PIPE_CAP_VERTEX_INPUT_ALIGNMENT:
+      return PIPE_VERTEX_INPUT_ALIGNMENT_ELEMENT;
 
    case PIPE_CAP_MAX_TEXTURE_2D_SIZE:
       return 1 << (PAN_MAX_MIP_LEVELS - 1);
@@ -376,6 +398,10 @@ panfrost_get_param(struct pipe_screen *screen, enum pipe_cap param)
 
    case PIPE_CAP_NATIVE_FENCE_FD:
       return 1;
+
+   case PIPE_CAP_CONTEXT_PRIORITY_MASK:
+      return from_kmod_group_allow_priority_flags(
+         dev->kmod.props.allowed_group_priorities_mask);
 
    case PIPE_CAP_ASTC_DECODE_MODE:
       return dev->arch >= 9 && (dev->compressed_formats & (1 << 30));
@@ -603,7 +629,8 @@ panfrost_is_format_supported(struct pipe_screen *screen,
     * differences. */
 
    bool supported =
-      panfrost_supports_compressed_format(dev, MALI_EXTRACT_INDEX(fmt.hw));
+      !util_format_is_compressed(format) ||
+      panfrost_supports_compressed_format(dev, fmt.texfeat_bit);
 
    if (!supported)
       return false;
@@ -649,23 +676,6 @@ panfrost_query_compression_modifiers(struct pipe_screen *screen,
    }
 
    *count = panfrost_afrc_get_modifiers(format, rate, max, modifiers);
-}
-
-static bool
-panfrost_is_compression_modifier(struct pipe_screen *screen,
-                                 enum pipe_format format, uint64_t modifier,
-                                 uint32_t *rate)
-{
-   struct panfrost_device *dev = pan_device(screen);
-   uint32_t compression_rate = panfrost_afrc_get_rate(format, modifier);
-
-   if (!dev->has_afrc)
-      return false;
-
-   if (rate)
-      *rate = compression_rate;
-
-   return (compression_rate != 0);
 }
 
 /* We always support linear and tiled operations, both external and internal.
@@ -864,8 +874,8 @@ panfrost_destroy_screen(struct pipe_screen *pscreen)
    struct panfrost_screen *screen = pan_screen(pscreen);
 
    panfrost_resource_screen_destroy(pscreen);
-   panfrost_pool_cleanup(&screen->blitter.bin_pool);
-   panfrost_pool_cleanup(&screen->blitter.desc_pool);
+   panfrost_pool_cleanup(&screen->mempools.bin);
+   panfrost_pool_cleanup(&screen->mempools.desc);
    pan_blend_shader_cache_cleanup(&dev->blend_shaders);
 
    if (screen->vtbl.screen_destroy)
@@ -1008,7 +1018,6 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
    screen->base.query_compression_rates = panfrost_query_compression_rates;
    screen->base.query_compression_modifiers =
       panfrost_query_compression_modifiers;
-   screen->base.is_compression_modifier = panfrost_is_compression_modifier;
 
    panfrost_resource_screen_init(&screen->base);
    pan_blend_shader_cache_init(&dev->blend_shaders,
@@ -1016,10 +1025,10 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
 
    panfrost_disk_cache_init(screen);
 
-   panfrost_pool_init(&screen->blitter.bin_pool, NULL, dev, PAN_BO_EXECUTE,
-                      4096, "Blitter shaders", false, true);
-   panfrost_pool_init(&screen->blitter.desc_pool, NULL, dev, 0, 65536,
-                      "Blitter RSDs", false, true);
+   panfrost_pool_init(&screen->mempools.bin, NULL, dev, PAN_BO_EXECUTE, 4096,
+                      "Preload shaders", false, true);
+   panfrost_pool_init(&screen->mempools.desc, NULL, dev, 0, 65536,
+                      "Preload RSDs", false, true);
    if (dev->arch == 4)
       panfrost_cmdstream_screen_init_v4(screen);
    else if (dev->arch == 5)

@@ -309,7 +309,7 @@ public:
    }
 
    Definition def(RegClass rc, PhysReg reg) {
-      return Definition(program->allocateId(rc), reg, rc);
+      return Definition(tmp(rc), reg);
    }
 
    inline aco_opcode w64or32(WaveSpecificOpcode opcode) const {
@@ -365,7 +365,7 @@ public:
           assert(tmp.type() == RegType::sgpr && tmp.bytes() <= 8);
        % endif
        Operand op(tmp);
-       op.setFixed(aco::${fixed});
+       op.setPrecolored(aco::${fixed});
        return op;
    }
 
@@ -374,7 +374,7 @@ public:
           //vcc_hi and exec_hi can still be used in wave32
           assert(def.regClass().type() == RegType::sgpr && def.bytes() <= 8);
        % endif
-       def.setFixed(aco::${fixed});
+       def.setPrecolored(aco::${fixed});
        return def;
    }
 
@@ -558,7 +558,7 @@ formats = [("pseudo", [Format.PSEUDO], list(itertools.product(range(5), range(6)
            ("sopp", [Format.SOPP], itertools.product([0, 1], [0, 1])),
            ("sopc", [Format.SOPC], [(1, 2)]),
            ("smem", [Format.SMEM], [(0, 4), (0, 3), (1, 0), (1, 3), (1, 2), (1, 1), (0, 0)]),
-           ("ds", [Format.DS], [(1, 1), (1, 2), (1, 3), (0, 3), (0, 4)]),
+           ("ds", [Format.DS], [(1, 0), (1, 1), (1, 2), (1, 3), (0, 3), (0, 4)]),
            ("ldsdir", [Format.LDSDIR], [(1, 1)]),
            ("mubuf", [Format.MUBUF], [(0, 4), (1, 3), (1, 4)]),
            ("mtbuf", [Format.MTBUF], [(0, 4), (1, 3)]),

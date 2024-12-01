@@ -110,6 +110,9 @@ radv_shader_stage_init(const VkShaderCreateInfoEXT *sinfo, struct radv_shader_st
       out_stage->key.subgroup_require_full = 1;
    }
 
+   if (sinfo->flags & VK_SHADER_CREATE_INDIRECT_BINDABLE_BIT_EXT)
+      out_stage->key.indirect_bindable = 1;
+
    if (out_stage->stage == MESA_SHADER_MESH) {
       out_stage->key.has_task_shader = !(sinfo->flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT);
    }
@@ -183,7 +186,7 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
       struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES] = {NULL};
       struct radv_shader_binary *binaries[MESA_VULKAN_SHADER_STAGES] = {NULL};
 
-      radv_graphics_shaders_compile(device, NULL, stages, &gfx_state, true, false, false, NULL, false, shaders,
+      radv_graphics_shaders_compile(device, NULL, stages, &gfx_state, false, false, false, NULL, false, shaders,
                                     binaries, &shader_obj->gs.copy_shader, &shader_obj->gs.copy_binary);
 
       shader = shaders[stage];
@@ -202,7 +205,7 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
          radv_shader_stage_init(pCreateInfo, &stages[stage]);
          stages[stage].next_stage = next_stage;
 
-         radv_graphics_shaders_compile(device, NULL, stages, &gfx_state, true, false, false, NULL, false, shaders,
+         radv_graphics_shaders_compile(device, NULL, stages, &gfx_state, false, false, false, NULL, false, shaders,
                                        binaries, &shader_obj->gs.copy_shader, &shader_obj->gs.copy_binary);
 
          shader = shaders[stage];
@@ -248,7 +251,7 @@ radv_shader_object_init_compute(struct radv_shader_object *shader_obj, struct ra
 
    radv_shader_stage_init(pCreateInfo, &stage);
 
-   struct radv_shader *cs_shader = radv_compile_cs(device, NULL, &stage, true, false, false, &cs_binary);
+   struct radv_shader *cs_shader = radv_compile_cs(device, NULL, &stage, false, false, false, &cs_binary);
 
    ralloc_free(stage.nir);
 
@@ -509,7 +512,7 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
    struct radv_shader *gs_copy_shader = NULL;
    struct radv_shader_binary *gs_copy_binary = NULL;
 
-   radv_graphics_shaders_compile(device, NULL, stages, &gfx_state, true, false, false, NULL, false, shaders, binaries,
+   radv_graphics_shaders_compile(device, NULL, stages, &gfx_state, false, false, false, NULL, false, shaders, binaries,
                                  &gs_copy_shader, &gs_copy_binary);
 
    for (unsigned i = 0; i < createInfoCount; i++) {

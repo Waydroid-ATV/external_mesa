@@ -371,7 +371,7 @@ bi_is_value_equiv(bi_index left, bi_index right)
 
 #define BI_MAX_VEC   8
 #define BI_MAX_DESTS 4
-#define BI_MAX_SRCS  6
+#define BI_MAX_SRCS  8
 
 typedef struct {
    /* Must be first */
@@ -508,6 +508,10 @@ typedef struct {
          bool texel_offset;
          bool array_enable;
          bool integer_coordinates;
+         bool derivative_enable;
+         bool force_delta_enable;
+         bool lod_bias_disable;
+         bool lod_clamp_disable;
          enum bi_fetch_component fetch_component;
          enum bi_va_lod_mode va_lod_mode;
          enum bi_dimension dimension;

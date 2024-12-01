@@ -42,11 +42,11 @@
 
 #include "pan_afbc_cso.h"
 #include "pan_blend.h"
-#include "pan_blitter.h"
 #include "pan_bo.h"
 #include "pan_cmdstream.h"
 #include "pan_context.h"
 #include "pan_csf.h"
+#include "pan_fb_preload.h"
 #include "pan_format.h"
 #include "pan_indirect_dispatch.h"
 #include "pan_jm.h"
@@ -856,6 +856,8 @@ panfrost_emit_vertex_buffers(struct panfrost_batch *batch)
       pan_pool_alloc_desc_array(&batch->pool.base, buffer_count, BUFFER);
    struct mali_buffer_packed *buffers = T.cpu;
 
+   memset(buffers, 0, sizeof(*buffers) * buffer_count);
+
    u_foreach_bit(i, ctx->vb_mask) {
       struct pipe_vertex_buffer vb = ctx->vertex_buffers[i];
       struct pipe_resource *prsrc = vb.buffer.resource;
@@ -917,17 +919,6 @@ panfrost_emit_images(struct panfrost_batch *batch, enum pipe_shader_type stage)
          .base = util_image_to_sampler_view(image),
          .pool = &batch->pool,
       };
-
-      /* If we specify a cube map, the hardware internally treat it as
-       * a 2D array. Since cube maps as images can confuse our common
-       * texturing code, explicitly use a 2D array.
-       *
-       * Similar concerns apply to 3D textures.
-       */
-      if (view.base.target == PIPE_BUFFER)
-         view.base.target = PIPE_BUFFER;
-      else
-         view.base.target = PIPE_TEXTURE_2D_ARRAY;
 
       panfrost_update_sampler_view(&view, &ctx->base);
       out[i] = view.bifrost_descriptor;
@@ -1415,14 +1406,18 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
    struct panfrost_compiled_shader *shader = ctx->prog[stage];
    unsigned ubo_count = shader->info.ubo_count - (sys_size ? 1 : 0);
    unsigned sysval_ubo = sys_size ? ubo_count : ~0;
+   unsigned desc_size;
    struct panfrost_ptr ubos = {0};
 
 #if PAN_ARCH >= 9
+   desc_size = sizeof(struct mali_buffer_packed);
    ubos = pan_pool_alloc_desc_array(&batch->pool.base, ubo_count + 1, BUFFER);
 #else
+   desc_size = sizeof(struct mali_uniform_buffer_packed);
    ubos = pan_pool_alloc_desc_array(&batch->pool.base, ubo_count + 1,
                                     UNIFORM_BUFFER);
 #endif
+   memset(ubos.cpu, 0, desc_size * (ubo_count + 1));
 
    if (buffer_count)
       *buffer_count = ubo_count + (sys_size ? 1 : 0);
@@ -2610,8 +2605,7 @@ emit_fbd(struct panfrost_batch *batch, struct pan_fb_info *fb)
       panfrost_sample_positions_offset(pan_sample_pattern(fb->nr_samples));
 #endif
 
-   batch->framebuffer.gpu |=
-      GENX(pan_emit_fbd)(fb, 0, &tls, &batch->tiler_ctx, batch->framebuffer.cpu);
+   JOBX(emit_fbds)(batch, fb, &tls);
 }
 
 /* Mark a surface as written */
@@ -3655,6 +3649,7 @@ panfrost_create_blend_state(struct pipe_context *pipe,
    so->pan.logicop_enable = blend->logicop_enable;
    so->pan.logicop_func = blend->logicop_func;
    so->pan.rt_count = blend->max_rt + 1;
+   so->pan.alpha_to_one = blend->alpha_to_one;
 
    for (unsigned c = 0; c < so->pan.rt_count; ++c) {
       unsigned g = blend->independent_blend_enable ? c : 0;
@@ -3828,7 +3823,7 @@ static void
 screen_destroy(struct pipe_screen *pscreen)
 {
    struct panfrost_device *dev = pan_device(pscreen);
-   GENX(pan_blitter_cache_cleanup)(&dev->blitter);
+   GENX(pan_fb_preload_cache_cleanup)(&dev->fb_preload_cache);
 }
 
 static void
@@ -3982,13 +3977,13 @@ GENX(panfrost_cmdstream_screen_init)(struct panfrost_screen *screen)
    screen->vtbl.afbc_pack = panfrost_afbc_pack;
    screen->vtbl.emit_write_timestamp = emit_write_timestamp;
 
-   GENX(pan_blitter_cache_init)
-   (&dev->blitter, panfrost_device_gpu_id(dev), &dev->blend_shaders,
-    &screen->blitter.bin_pool.base, &screen->blitter.desc_pool.base);
+   GENX(pan_fb_preload_cache_init)
+   (&dev->fb_preload_cache, panfrost_device_gpu_id(dev), &dev->blend_shaders,
+    &screen->mempools.bin.base, &screen->mempools.desc.base);
 
 #if PAN_GPU_SUPPORTS_DISPATCH_INDIRECT
    pan_indirect_dispatch_meta_init(
       &dev->indirect_dispatch, panfrost_device_gpu_id(dev),
-      &screen->blitter.bin_pool.base, &screen->blitter.desc_pool.base);
+      &screen->mempools.bin.base, &screen->mempools.desc.base);
 #endif
 }

@@ -144,6 +144,7 @@ struct hk_render_registers {
    struct agx_zls_control_packed zls_control, zls_control_partial;
    uint32_t iogpu_unk_214;
    uint32_t depth_dimensions;
+   bool process_empty_tiles;
 
    struct {
       uint32_t dimensions;
@@ -260,7 +261,12 @@ struct hk_graphics_state {
    bool generate_primitive_id;
 
    /* Tessellation state */
-   uint64_t tess_out_draws;
+   struct {
+      uint64_t out_draws;
+      uint64_t grids;
+      struct hk_tess_info info;
+      enum mesa_prim prim;
+   } tess;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;
@@ -323,6 +329,16 @@ struct hk_cs {
 
       struct hk_scratch_req fs;
    } scratch;
+
+   /* Immediate writes, type libagx_imm_write. These all happen in parallel at
+    * the end of the control stream. This accelerates queries. Implies CDM.
+    */
+   struct util_dynarray imm_writes;
+
+   /* Statistics */
+   struct {
+      uint32_t calls, cmds, flushes;
+   } stats;
 
    /* Remaining state is for graphics only, ignored for compute */
    struct agx_tilebuffer_layout tib;
@@ -559,16 +575,29 @@ hk_cs_destroy(struct hk_cs *cs)
    if (cs->type == HK_CS_VDM) {
       util_dynarray_fini(&cs->scissor);
       util_dynarray_fini(&cs->depth_bias);
+   } else {
+      util_dynarray_fini(&cs->imm_writes);
    }
 
    free(cs);
 }
 
+void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
 static void
-hk_cmd_buffer_end_compute_internal(struct hk_cs **ptr)
+hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
+                                   struct hk_cs **ptr)
 {
    if (*ptr) {
       struct hk_cs *cs = *ptr;
+
+      /* This control stream may write immediates as it ends. Queue the writes
+       * now that we're done emitting everything else.
+       */
+      if (cs->imm_writes.size) {
+         hk_dispatch_imm_writes(cmd, cs);
+      }
+
       void *map = cs->current;
       agx_push(map, CDM_STREAM_TERMINATE, _)
          ;
@@ -582,7 +611,7 @@ hk_cmd_buffer_end_compute_internal(struct hk_cs **ptr)
 static void
 hk_cmd_buffer_end_compute(struct hk_cmd_buffer *cmd)
 {
-   hk_cmd_buffer_end_compute_internal(&cmd->current_cs.cs);
+   hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.cs);
 }
 
 static void
@@ -609,9 +638,10 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 
       cmd->current_cs.gfx->current = map;
       cmd->current_cs.gfx = NULL;
-      hk_cmd_buffer_end_compute_internal(&cmd->current_cs.pre_gfx);
-      hk_cmd_buffer_end_compute_internal(&cmd->current_cs.post_gfx);
    }
+
+   hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.pre_gfx);
+   hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
 
    assert(cmd->current_cs.gfx == NULL);
 
@@ -678,12 +708,6 @@ hk_get_descriptors_state(struct hk_cmd_buffer *cmd,
    }
 };
 
-void hk_cmd_flush_wait_dep(struct hk_cmd_buffer *cmd,
-                           const VkDependencyInfo *dep, bool wait);
-
-void hk_cmd_invalidate_deps(struct hk_cmd_buffer *cmd, uint32_t dep_count,
-                            const VkDependencyInfo *deps);
-
 void hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
                                           struct hk_descriptor_state *desc);
 
@@ -710,6 +734,7 @@ void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
 
 struct hk_grid {
    bool indirect;
+   bool indirect_local;
    union {
       uint32_t count[3];
       uint64_t ptr;
@@ -726,6 +751,16 @@ static struct hk_grid
 hk_grid_indirect(uint64_t ptr)
 {
    return (struct hk_grid){.indirect = true, .ptr = ptr};
+}
+
+static struct hk_grid
+hk_grid_indirect_local(uint64_t ptr)
+{
+   return (struct hk_grid){
+      .indirect = true,
+      .indirect_local = true,
+      .ptr = ptr,
+   };
 }
 
 void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,

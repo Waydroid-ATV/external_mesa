@@ -17,7 +17,6 @@
 #include "util/disk_cache.h"
 #include "util/hex.h"
 #include "util/u_cpu_detect.h"
-#include "util/u_log.h"
 #include "util/u_memory.h"
 #include "util/u_suballoc.h"
 #include "util/u_tests.h"
@@ -155,9 +154,9 @@ struct ac_llvm_compiler *si_create_llvm_compiler(struct si_screen *sscreen)
    if (!ac_init_llvm_compiler(compiler, sscreen->info.family, tm_options))
       return NULL;
 
-   compiler->passes = ac_create_llvm_passes(compiler->tm);
+   compiler->beo = ac_create_backend_optimizer(compiler->tm);
    if (compiler->low_opt_tm)
-      compiler->low_opt_passes = ac_create_llvm_passes(compiler->low_opt_tm);
+      compiler->low_opt_beo = ac_create_backend_optimizer(compiler->low_opt_tm);
 
    return compiler;
 #else
@@ -279,6 +278,11 @@ static void si_destroy_context(struct pipe_context *context)
    }
    if (sctx->no_velems_state)
       sctx->b.delete_vertex_elements_state(&sctx->b, sctx->no_velems_state);
+
+   if (sctx->global_buffers) {
+      sctx->b.set_global_binding(&sctx->b, 0, sctx->max_global_buffers, NULL, NULL);
+      FREE(sctx->global_buffers);
+   }
 
    for (unsigned i = 0; i < ARRAY_SIZE(sctx->cs_fmask_expand); i++) {
       for (unsigned j = 0; j < ARRAY_SIZE(sctx->cs_fmask_expand[i]); j++) {
@@ -841,12 +845,10 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
          if (status != PIPE_NO_RESET) {
             /* We lost the aux_context, create a new one */
             unsigned context_flags = saux->context_flags;
-            struct u_log_context *aux_log = saux->log;
-            saux->b.set_log_context(&saux->b, NULL);
             saux->b.destroy(&saux->b);
 
             saux = (struct si_context *)si_create_context(&sscreen->b, context_flags);
-            saux->b.set_log_context(&saux->b, aux_log);
+            saux->b.set_log_context(&saux->b, &sscreen->aux_contexts[i].log);
 
             sscreen->aux_contexts[i].ctx = &saux->b;
          }
@@ -1188,7 +1190,13 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
       sscreen->info.register_shadowing_required = true;
 
 #if AMD_LLVM_AVAILABLE
-   sscreen->use_aco = (sscreen->debug_flags & DBG(USE_ACO));
+   /* For GFX11.5, LLVM < 19 is missing a workaround that can cause GPU hangs. ACO is the only
+    * alternative that has the workaround and is always available.
+    */
+   if (sscreen->info.gfx_level == GFX11_5 && LLVM_VERSION_MAJOR < 19)
+      sscreen->use_aco = true;
+   else
+      sscreen->use_aco = (sscreen->debug_flags & DBG(USE_ACO));
 #else
    sscreen->use_aco = true;
 #endif
@@ -1472,6 +1480,7 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
       (void)mtx_init(&sscreen->aux_contexts[i].lock, mtx_plain | mtx_recursive);
 
       bool compute = !sscreen->info.has_graphics ||
+                     &sscreen->aux_contexts[i] == &sscreen->aux_context.compute_resource_init ||
                      &sscreen->aux_contexts[i] == &sscreen->aux_context.shader_upload;
       sscreen->aux_contexts[i].ctx =
          si_create_context(&sscreen->b,
@@ -1480,12 +1489,10 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
                            (compute ? PIPE_CONTEXT_COMPUTE_ONLY : 0));
 
       if (sscreen->options.aux_debug) {
-         struct u_log_context *log = CALLOC_STRUCT(u_log_context);
-         u_log_context_init(log);
+         u_log_context_init(&sscreen->aux_contexts[i].log);
 
-         struct si_context *sctx = si_get_aux_context(&sscreen->aux_context.general);
-         sctx->b.set_log_context(&sctx->b, log);
-         si_put_aux_context_flush(&sscreen->aux_context.general);
+         struct pipe_context *ctx = sscreen->aux_contexts[i].ctx;
+         ctx->set_log_context(ctx, &sscreen->aux_contexts[i].log);
       }
    }
 

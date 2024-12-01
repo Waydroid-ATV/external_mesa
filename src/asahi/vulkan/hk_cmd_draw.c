@@ -65,6 +65,11 @@
 #define IS_LINKED_DIRTY(bit)                                                   \
    (cmd->state.gfx.linked_dirty & BITFIELD_BIT(MESA_SHADER_##bit))
 
+/* CTS coverage of indirect draws is pretty bad, so it's helpful to be able to
+ * get some extra smoke testing.
+ */
+#define HK_TEST_INDIRECTS (0)
+
 struct hk_draw {
    struct hk_grid b;
    struct hk_addr_range index;
@@ -73,15 +78,38 @@ struct hk_draw {
    uint32_t index_bias;
    uint32_t start_instance;
 
-   /* Indicates that the indirect draw consists of raw VDM commands and should
-    * be stream linked to. Used to accelerate tessellation.
-    */
-   bool raw;
-
    /* Set within hk_draw() but here so geometry/tessellation can override */
    bool restart;
    enum agx_index_size index_size;
 };
+
+UNUSED static inline void
+print_draw(struct hk_draw d, FILE *fp)
+{
+   if (d.b.indirect)
+      fprintf(fp, "indirect (buffer %" PRIx64 "):", d.b.ptr);
+   else
+      fprintf(fp, "direct (%ux%u):", d.b.count[0], d.b.count[1]);
+
+   if (d.index_size)
+      fprintf(fp, " index_size=%u", agx_index_size_to_B(d.index_size));
+   else
+      fprintf(fp, " non-indexed");
+
+   if (d.restart)
+      fprintf(fp, " restart");
+
+   if (d.index_bias)
+      fprintf(fp, " index_bias=%u", d.index_bias);
+
+   if (d.start)
+      fprintf(fp, " start=%u", d.start);
+
+   if (d.start_instance)
+      fprintf(fp, " start_instance=%u", d.start_instance);
+
+   fprintf(fp, "\n");
+}
 
 static struct hk_draw
 hk_draw_indirect(uint64_t ptr)
@@ -158,6 +186,9 @@ hk_cmd_buffer_dirty_render_pass(struct hk_cmd_buffer *cmd)
 
    /* This may depend on render targets for ESO */
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
+
+   /* This may depend on render targets */
+   BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP);
 }
 
 void
@@ -193,6 +224,18 @@ hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
          render->depth_att.vk_format = inheritance_info->depthAttachmentFormat;
          render->stencil_att.vk_format =
             inheritance_info->stencilAttachmentFormat;
+
+         const VkRenderingAttachmentLocationInfoKHR att_loc_info_default = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+            .colorAttachmentCount = inheritance_info->colorAttachmentCount,
+         };
+         const VkRenderingAttachmentLocationInfoKHR *att_loc_info =
+            vk_get_command_buffer_rendering_attachment_location_info(
+               cmd->vk.level, pBeginInfo);
+         if (att_loc_info == NULL)
+            att_loc_info = &att_loc_info_default;
+
+         vk_cmd_set_rendering_attachment_locations(&cmd->vk, att_loc_info);
 
          hk_cmd_buffer_dirty_render_pass(cmd);
       }
@@ -258,6 +301,16 @@ hk_GetRenderingAreaGranularityKHR(
    *pGranularity = (VkExtent2D){.width = 1, .height = 1};
 }
 
+static bool
+is_attachment_stored(const VkRenderingAttachmentInfo *att)
+{
+   /* When resolving, we store the intermediate multisampled image as the
+    * resolve is a separate control stream. This could be optimized.
+    */
+   return att->storeOp == VK_ATTACHMENT_STORE_OP_STORE ||
+          att->resolveMode != VK_RESOLVE_MODE_NONE;
+}
+
 static struct hk_bg_eot
 hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                 bool store, bool partial_render, bool incomplete_render_area)
@@ -287,17 +340,12 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
          continue;
 
       if (store) {
-         bool store = att_info->storeOp == VK_ATTACHMENT_STORE_OP_STORE;
-
-         /* When resolving, we store the intermediate multisampled image as the
-          * resolve is a separate control stream. This could be optimized.
-          */
-         store |= att_info->resolveMode != VK_RESOLVE_MODE_NONE;
+         bool should_store = is_attachment_stored(att_info);
 
          /* Partial renders always need to flush to memory. */
-         store |= partial_render;
+         should_store |= partial_render;
 
-         if (store)
+         if (should_store)
             key.op[i] = AGX_EOT_STORE;
       } else {
          bool load = att_info->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -315,6 +363,31 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
 
          /* Don't read back spilled render targets, they're already in memory */
          load &= !key.tib.spilled[i];
+
+         /* This is a very frustrating corner case. From the spec:
+          *
+          *     VK_ATTACHMENT_STORE_OP_NONE specifies the contents within the
+          *     render area are not accessed by the store operation as long as
+          *     no values are written to the attachment during the render pass.
+          *
+          * With VK_ATTACHMENT_STORE_OP_NONE, we suppress stores on the main
+          * end-of-tile program. Unfortunately, that's not enough: we also need
+          * to preserve the contents throughout partial renders. The easiest way
+          * to do that is forcing a load in the background program, so that
+          * partial stores for unused attachments will be no-op'd by writing
+          * existing contents.
+          *
+          * Optimizing this would require nontrivial tracking. Fortunately,
+          * this is all Android gunk and we don't have to care too much for
+          * dekstop games. So do the simple thing.
+          */
+         bool no_store = (att_info->storeOp == VK_ATTACHMENT_STORE_OP_NONE);
+         bool no_store_wa = no_store && !load && !clear;
+         if (no_store_wa) {
+            perf_debug(dev, "STORE_OP_NONE workaround");
+         }
+
+         load |= no_store_wa;
 
          /* Don't apply clears for spilled render targets when we clear the
           * render area explicitly after.
@@ -478,9 +551,14 @@ hk_pack_zls_control(struct agx_zls_control_packed *packed,
 {
    agx_pack(packed, ZLS_CONTROL, zls_control) {
       if (z_layout) {
+         /* XXX: Dropping Z stores is wrong if the render pass gets split into
+          * multiple control streams (can that ever happen?) We need more ZLS
+          * variants. Force || true for now.
+          */
          zls_control.z_store_enable =
             attach_z->storeOp == VK_ATTACHMENT_STORE_OP_STORE ||
-            attach_z->resolveMode != VK_RESOLVE_MODE_NONE || partial_render;
+            attach_z->resolveMode != VK_RESOLVE_MODE_NONE || partial_render ||
+            true;
 
          zls_control.z_load_enable =
             attach_z->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD || partial_render ||
@@ -528,6 +606,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    memset(render, 0, sizeof(*render));
 
@@ -569,7 +648,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    /* Choose a tilebuffer layout given the framebuffer key */
    enum pipe_format formats[HK_MAX_RTS] = {0};
    for (unsigned i = 0; i < render->color_att_count; ++i) {
-      formats[i] = vk_format_to_pipe_format(render->color_att[i].vk_format);
+      formats[i] = hk_format_to_pipe_format(render->color_att[i].vk_format);
    }
 
    /* For now, we force layered=true since it makes compatibility problems way
@@ -577,6 +656,12 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     */
    render->tilebuffer = agx_build_tilebuffer_layout(
       formats, render->color_att_count, render->tilebuffer.nr_samples, true);
+
+   const VkRenderingAttachmentLocationInfoKHR ral_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+      .colorAttachmentCount = pRenderingInfo->colorAttachmentCount,
+   };
+   vk_cmd_set_rendering_attachment_locations(&cmd->vk, &ral_info);
 
    hk_cmd_buffer_dirty_render_pass(cmd);
 
@@ -593,6 +678,12 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       (render->view_mask &&
        render->view_mask != BITFIELD64_MASK(render->cr.layers));
 
+   perf_debug(dev, "Rendering %ux%ux%u@%u %s%s", render->cr.width,
+              render->cr.height, render->cr.layers,
+              render->tilebuffer.nr_samples,
+              render->view_mask ? " multiview" : "",
+              incomplete_render_area ? " incomplete" : "");
+
    render->cr.bg.main = hk_build_bg_eot(cmd, pRenderingInfo, false, false,
                                         incomplete_render_area);
    render->cr.bg.partial =
@@ -600,7 +691,8 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    render->cr.eot.main =
       hk_build_bg_eot(cmd, pRenderingInfo, true, false, incomplete_render_area);
-   render->cr.eot.partial = render->cr.eot.main;
+   render->cr.eot.partial =
+      hk_build_bg_eot(cmd, pRenderingInfo, true, true, incomplete_render_area);
 
    render->cr.isp_bgobjvals = 0x300;
 
@@ -623,7 +715,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       unsigned first_layer = view->vk.base_array_layer;
 
       const struct util_format_description *desc =
-         util_format_description(vk_format_to_pipe_format(view->vk.format));
+         util_format_description(hk_format_to_pipe_format(view->vk.format));
 
       assert(desc->format == PIPE_FORMAT_Z32_FLOAT ||
              desc->format == PIPE_FORMAT_Z16_UNORM ||
@@ -740,7 +832,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    cs->cr.zls_control = render->cr.zls_control;
 
    /* Reordering barrier for post-gfx, in case we had any. */
-   hk_cmd_buffer_end_compute_internal(&cmd->current_cs.post_gfx);
+   hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
 
    /* Don't reorder compute across render passes.
     *
@@ -755,8 +847,6 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * we're not that clever yet.
     */
    if (agx_tilebuffer_spills(&render->tilebuffer)) {
-      struct hk_device *dev = hk_cmd_buffer_device(cmd);
-
       perf_debug(dev, "eMRT render pass");
 
       for (unsigned i = 0; i < render->color_att_count; ++i) {
@@ -809,54 +899,69 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       }
    }
 
-   if (incomplete_render_area) {
-      uint32_t clear_count = 0;
-      VkClearAttachment clear_att[HK_MAX_RTS + 1];
-      for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
-         const VkRenderingAttachmentInfo *att_info =
-            &pRenderingInfo->pColorAttachments[i];
-         if (att_info->imageView == VK_NULL_HANDLE ||
-             att_info->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
-            continue;
+   uint32_t clear_count = 0;
+   VkClearAttachment clear_att[HK_MAX_RTS + 1];
+   bool resolved_clear = false;
 
-         clear_att[clear_count++] = (VkClearAttachment){
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .colorAttachment = i,
-            .clearValue = att_info->clearValue,
-         };
-      }
+   for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
+      const VkRenderingAttachmentInfo *att_info =
+         &pRenderingInfo->pColorAttachments[i];
+      if (att_info->imageView == VK_NULL_HANDLE ||
+          att_info->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
+         continue;
 
-      clear_att[clear_count] = (VkClearAttachment){
-         .aspectMask = 0,
+      clear_att[clear_count++] = (VkClearAttachment){
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .colorAttachment = i,
+         .clearValue = att_info->clearValue,
       };
 
-      if (attach_z && attach_z->imageView != VK_NULL_HANDLE &&
-          attach_z->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-         clear_att[clear_count].aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
-         clear_att[clear_count].clearValue.depthStencil.depth =
-            attach_z->clearValue.depthStencil.depth;
-      }
+      resolved_clear |= is_attachment_stored(att_info);
+   }
 
-      if (attach_s != NULL && attach_s->imageView != VK_NULL_HANDLE &&
-          attach_s->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-         clear_att[clear_count].aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
-         clear_att[clear_count].clearValue.depthStencil.stencil =
-            attach_s->clearValue.depthStencil.stencil;
-      }
+   clear_att[clear_count] = (VkClearAttachment){
+      .aspectMask = 0,
+   };
 
-      if (clear_att[clear_count].aspectMask != 0)
-         clear_count++;
+   if (attach_z && attach_z->imageView != VK_NULL_HANDLE &&
+       attach_z->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      clear_att[clear_count].aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      clear_att[clear_count].clearValue.depthStencil.depth =
+         attach_z->clearValue.depthStencil.depth;
 
-      if (clear_count > 0) {
-         const VkClearRect clear_rect = {
-            .rect = render->area,
-            .baseArrayLayer = 0,
-            .layerCount = render->view_mask ? 1 : render->layer_count,
-         };
+      resolved_clear |= is_attachment_stored(attach_z);
+   }
 
-         hk_CmdClearAttachments(hk_cmd_buffer_to_handle(cmd), clear_count,
-                                clear_att, 1, &clear_rect);
-      }
+   if (attach_s != NULL && attach_s->imageView != VK_NULL_HANDLE &&
+       attach_s->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      clear_att[clear_count].aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+      clear_att[clear_count].clearValue.depthStencil.stencil =
+         attach_s->clearValue.depthStencil.stencil;
+
+      resolved_clear |= is_attachment_stored(attach_s);
+   }
+
+   if (clear_att[clear_count].aspectMask != 0)
+      clear_count++;
+
+   if (clear_count > 0 && incomplete_render_area) {
+      const VkClearRect clear_rect = {
+         .rect = render->area,
+         .baseArrayLayer = 0,
+         .layerCount = render->view_mask ? 1 : render->layer_count,
+      };
+
+      hk_CmdClearAttachments(hk_cmd_buffer_to_handle(cmd), clear_count,
+                             clear_att, 1, &clear_rect);
+   } else {
+      /* If a tile is empty, we do not want to process it, as the redundant
+       * roundtrip of memory-->tilebuffer-->memory wastes a tremendous amount of
+       * memory bandwidth. Any draw marks a tile as non-empty, so we only need
+       * to process empty tiles if the background+EOT programs have a side
+       * effect. This is the case exactly when there is an attachment we are
+       * fast clearing and then storing.
+       */
+      cs->cr.process_empty_tiles = resolved_clear;
    }
 }
 
@@ -865,7 +970,17 @@ hk_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   /* The last control stream of the render pass is special since it gets its
+    * stores dropped. Swap it in.
+    */
+   struct hk_cs *cs = cmd->current_cs.gfx;
+   if (cs) {
+      cs->cr.eot.main = render->cr.eot.main;
+   }
+
+   perf_debug(dev, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
 
    bool need_resolve = false;
@@ -928,6 +1043,9 @@ hk_CmdEndRendering(VkCommandBuffer commandBuffer)
    memset(render, 0, sizeof(*render));
 
    if (need_resolve) {
+      perf_debug(dev, "Resolving render pass, colour store op %u",
+                 vk_color_att[0].storeOp);
+
       hk_meta_resolve_rendering(cmd, &vk_render);
    }
 }
@@ -939,6 +1057,8 @@ hk_geometry_state(struct hk_cmd_buffer *cmd)
 
    /* We tie heap allocation to geometry state allocation, so allocate now. */
    if (unlikely(!dev->heap)) {
+      perf_debug(dev, "Allocating heap");
+
       size_t size = 128 * 1024 * 1024;
       dev->heap = agx_bo_create(&dev->dev, size, 0, 0, "Geometry heap");
 
@@ -956,6 +1076,7 @@ hk_geometry_state(struct hk_cmd_buffer *cmd)
 
    /* We need to free all allocations after each command buffer execution */
    if (!cmd->uses_heap) {
+      perf_debug(dev, "Freeing heap");
       uint64_t addr = dev->rodata.geometry_state;
 
       /* Zeroing the allocated index frees everything */
@@ -1037,7 +1158,7 @@ hk_gs_in_prim(struct hk_cmd_buffer *cmd)
    struct hk_api_shader *tes = gfx->shaders[MESA_SHADER_TESS_EVAL];
 
    if (tes != NULL)
-      return tes->variants[HK_GS_VARIANT_RAST].info.ts.out_prim;
+      return gfx->tess.prim;
    else
       return vk_conv_topology(dyn->ia.primitive_topology);
 }
@@ -1133,48 +1254,44 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct hk_draw draw)
    return hk_pool_upload(cmd, &params, sizeof(params), 8);
 }
 
-/*
- * Tessellation has a fast path where the tessellator generates a VDM Index List
- * command per patch, as well as a slow path using prefix sums to generate a
- * single combined API draw. We need the latter if tessellation is fed into
- * another software stage (geometry shading), or if we need accurate primitive
- * IDs in the linked fragment shader (since that would require a prefix sum
- * anyway).
- */
-static bool
-hk_tess_needs_prefix_sum(struct hk_cmd_buffer *cmd)
-{
-   struct hk_graphics_state *gfx = &cmd->state.gfx;
-
-   return gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->generate_primitive_id;
-}
-
-static uint64_t
-hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct hk_draw draw)
+static void
+hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct libagx_tess_args *out,
+                      struct hk_draw draw)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_shader *tcs = hk_only_variant(gfx->shaders[MESA_SHADER_TESS_CTRL]);
-   struct hk_shader *tes = hk_any_variant(gfx->shaders[MESA_SHADER_TESS_EVAL]);
+
+   enum libagx_tess_partitioning partitioning =
+      gfx->tess.info.spacing == TESS_SPACING_EQUAL
+         ? LIBAGX_TESS_PARTITIONING_INTEGER
+      : gfx->tess.info.spacing == TESS_SPACING_FRACTIONAL_ODD
+         ? LIBAGX_TESS_PARTITIONING_FRACTIONAL_ODD
+         : LIBAGX_TESS_PARTITIONING_FRACTIONAL_EVEN;
 
    struct libagx_tess_args args = {
       .heap = hk_geometry_state(cmd),
-      .tcs_stride_el = tcs->info.tcs.output_stride / 4,
+      .tcs_stride_el = tcs->info.tess.tcs_output_stride / 4,
       .statistic = hk_pipeline_stat_addr(
          cmd,
          VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_EVALUATION_SHADER_INVOCATIONS_BIT),
 
       .input_patch_size = dyn->ts.patch_control_points,
-      .output_patch_size = tcs->info.tcs.output_patch_size,
-      .tcs_patch_constants = tcs->info.tcs.nr_patch_outputs,
-      .tcs_per_vertex_outputs = tcs->info.tcs.per_vertex_outputs,
+      .output_patch_size = tcs->info.tess.tcs_output_patch_size,
+      .tcs_patch_constants = tcs->info.tess.tcs_nr_patch_outputs,
+      .tcs_per_vertex_outputs = tcs->info.tess.tcs_per_vertex_outputs,
+      .partitioning = partitioning,
+      .points_mode = gfx->tess.info.points,
    };
 
-   bool with_counts = hk_tess_needs_prefix_sum(cmd);
+   if (!args.points_mode && gfx->tess.info.mode != TESS_PRIMITIVE_ISOLINES) {
+      args.ccw = gfx->tess.info.ccw;
+      args.ccw ^=
+         dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+   }
 
-   /* This assumes !with_counts, if we have counts it's only one draw */
-   uint32_t draw_stride_el = tes->info.ts.point_mode ? 4 : 6;
+   uint32_t draw_stride_el = 5;
    size_t draw_stride_B = draw_stride_el * sizeof(uint32_t);
 
    /* heap is allocated by hk_geometry_state */
@@ -1195,19 +1312,11 @@ hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct hk_draw draw)
       alloc += unrolled_patches * 4 * 32;
 
       uint32_t count_offs = alloc;
-      if (with_counts)
-         alloc += unrolled_patches * sizeof(uint32_t) * 32;
+      alloc += unrolled_patches * sizeof(uint32_t) * 32;
 
+      /* Single API draw */
       uint32_t draw_offs = alloc;
-
-      if (with_counts) {
-         /* Single API draw */
-         alloc += 5 * sizeof(uint32_t);
-      } else {
-         /* Padding added because VDM overreads */
-         alloc += (draw_stride_B * unrolled_patches) +
-                  (AGX_VDM_BARRIER_LENGTH + 0x800);
-      }
+      alloc += draw_stride_B;
 
       struct agx_ptr blob = hk_pool_alloc(cmd, alloc, 4);
       args.tcs_buffer = blob.gpu + tcs_out_offs;
@@ -1215,53 +1324,37 @@ hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct hk_draw draw)
       args.coord_allocs = blob.gpu + patch_coord_offs;
       args.nr_patches = unrolled_patches;
       args.out_draws = blob.gpu + draw_offs;
-
-      gfx->tess_out_draws = args.out_draws;
-
-      if (with_counts) {
-         args.counts = blob.gpu + count_offs;
-      } else {
-         /* Arrange so we return after all generated draws */
-         uint8_t *ret = (uint8_t *)blob.cpu + draw_offs +
-                        (draw_stride_B * unrolled_patches);
-
-         agx_pack(ret, VDM_BARRIER, cfg) {
-            cfg.returns = true;
-         }
-      }
+      args.counts = blob.gpu + count_offs;
    } else {
-      unreachable("todo: indirect with tess");
-#if 0
-      args.tcs_statistic = agx_get_query_address(
-         batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_HS_INVOCATIONS]);
+      args.tcs_statistic = hk_pipeline_stat_addr(
+         cmd,
+         VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_CONTROL_SHADER_PATCHES_BIT);
 
-      args.indirect = agx_indirect_buffer_ptr(batch, indirect);
+      args.indirect = draw.b.ptr;
 
       /* Allocate 3x indirect global+local grids for VS/TCS/tess */
       uint32_t grid_stride = sizeof(uint32_t) * 6;
-      args.grids = agx_pool_alloc_aligned(&batch->pool, grid_stride * 3, 4).gpu;
+      args.grids = hk_pool_alloc(cmd, grid_stride * 3, 4).gpu;
+      gfx->tess.grids = args.grids;
 
-      vs_grid = agx_grid_indirect_local(args.grids + 0 * grid_stride);
-      tcs_grid = agx_grid_indirect_local(args.grids + 1 * grid_stride);
-      tess_grid = agx_grid_indirect_local(args.grids + 2 * grid_stride);
-
-      args.vertex_outputs = ctx->vs->b.info.outputs;
+      struct hk_shader *vs = hk_bound_sw_vs(gfx);
+      args.vertex_outputs = vs->b.info.outputs;
       args.vertex_output_buffer_ptr =
-         agx_pool_alloc_aligned(&batch->pool, 8, 8).gpu;
+         gfx->root +
+         offsetof(struct hk_root_descriptor_table, draw.vertex_output_buffer);
+      args.ia = gfx->descriptors.root.draw.input_assembly;
+      args.out_draws = hk_pool_alloc(cmd, draw_stride_B, 4).gpu;
 
-      batch->uniforms.vertex_output_buffer_ptr = args.vertex_output_buffer_ptr;
-
-      if (with_counts) {
-         args.out_draws = agx_pool_alloc_aligned_with_bo(
-                             &batch->pool, draw_stride, 4, &draw_bo)
-                             .gpu;
-      } else {
-         unreachable("need an extra indirection...");
+      if (draw.indexed) {
+         args.in_index_buffer = draw.index.addr;
+         args.in_index_size_B = agx_index_size_to_B(draw.index_size);
+         args.in_index_buffer_range_el =
+            draw.index.range / args.in_index_size_B;
       }
-#endif
    }
 
-   return hk_pool_upload(cmd, &args, sizeof(args), 8);
+   gfx->tess.out_draws = args.out_draws;
+   memcpy(out, &args, sizeof(args));
 }
 
 static struct hk_api_shader *
@@ -1510,10 +1603,11 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
 
    struct hk_shader *vs = hk_bound_sw_vs(gfx);
    struct hk_shader *tcs = hk_only_variant(gfx->shaders[MESA_SHADER_TESS_CTRL]);
-   struct hk_shader *tes = hk_any_variant(gfx->shaders[MESA_SHADER_TESS_EVAL]);
 
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    uint32_t input_patch_size = dyn->ts.patch_control_points;
+   uint64_t state = gfx->descriptors.root.draw.tess_params;
+   struct hk_tess_info info = gfx->tess.info;
 
    hk_ensure_cs_has_space(cmd, cs, 0x2000 /*XXX*/);
 
@@ -1524,31 +1618,31 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
 
    /* Setup grids */
    if (draw.b.indirect) {
-      unreachable("todo: indirect tess");
-#if 0
-      struct agx_gs_setup_indirect_key key = {.prim = mode};
+      perf_debug(dev, "Indirect tessellation");
 
-      struct hk_shader *gsi =
-         hk_meta_kernel(dev, agx_nir_gs_setup_indirect, &key, sizeof(key));
+      struct agx_tess_setup_indirect_key key = {
+         .point_mode = info.points,
+      };
 
-      uint64_t push = hk_upload_gsi_params(cmd, draw);
-      uint32_t usc = hk_upload_usc_words_kernel(cmd, gsi, &push, sizeof(push));
+      struct hk_shader *tsi =
+         hk_meta_kernel(dev, agx_nir_tess_setup_indirect, &key, sizeof(key));
 
-      hk_dispatch_with_usc(dev, cs, gsi, usc, hk_grid(1, 1, 1),
+      /* TODO */
+      uint32_t usc =
+         hk_upload_usc_words_kernel(cmd, tsi, &state, sizeof(state));
+
+      hk_dispatch_with_usc(dev, cs, tsi, usc, hk_grid(1, 1, 1),
                            hk_grid(1, 1, 1));
 
-      uint64_t geometry_params = desc->root.draw.geometry_params;
-      grid_vs = hk_grid_indirect(geometry_params +
-                                 offsetof(struct agx_geometry_params, vs_grid));
-
-      grid_gs = hk_grid_indirect(geometry_params +
-                                 offsetof(struct agx_geometry_params, gs_grid));
-#endif
+      uint32_t grid_stride = sizeof(uint32_t) * 6;
+      grid_vs = hk_grid_indirect_local(gfx->tess.grids + 0 * grid_stride);
+      grid_tcs = hk_grid_indirect_local(gfx->tess.grids + 1 * grid_stride);
+      grid_tess = hk_grid_indirect_local(gfx->tess.grids + 2 * grid_stride);
    } else {
       uint32_t patches = draw.b.count[0] / input_patch_size;
       grid_vs = grid_tcs = draw.b;
 
-      grid_tcs.count[0] = patches * tcs->info.tcs.output_patch_size;
+      grid_tcs.count[0] = patches * tcs->info.tess.tcs_output_patch_size;
       grid_tess = hk_grid(patches * draw.b.count[1], 1, 1);
 
       /* TCS invocation counter increments once per-patch */
@@ -1582,65 +1676,36 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
 
    hk_dispatch_with_usc(
       dev, cs, tcs, hk_upload_usc_words(cmd, tcs, tcs->only_linked), grid_tcs,
-      hk_grid(tcs->info.tcs.output_patch_size, 1, 1));
-
-   /* TODO indirect */
-
-   bool with_counts = hk_tess_needs_prefix_sum(cmd);
-   uint64_t state = gfx->descriptors.root.draw.tess_params;
-
-   /* If the domain is flipped, we need to flip the winding order */
-   bool ccw = tes->info.ts.ccw;
-   ccw ^= dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
-
-   enum libagx_tess_partitioning partitioning =
-      tes->info.ts.spacing == TESS_SPACING_EQUAL
-         ? LIBAGX_TESS_PARTITIONING_INTEGER
-      : tes->info.ts.spacing == TESS_SPACING_FRACTIONAL_ODD
-         ? LIBAGX_TESS_PARTITIONING_FRACTIONAL_ODD
-         : LIBAGX_TESS_PARTITIONING_FRACTIONAL_EVEN;
-
-   enum libagx_tess_output_primitive prim =
-      tes->info.ts.point_mode ? LIBAGX_TESS_OUTPUT_POINT
-      : ccw                   ? LIBAGX_TESS_OUTPUT_TRIANGLE_CCW
-                              : LIBAGX_TESS_OUTPUT_TRIANGLE_CW;
+      hk_grid(tcs->info.tess.tcs_output_patch_size, 1, 1));
 
    struct agx_tessellator_key key = {
-      .prim = tes->info.ts.mode,
-      .output_primitive = prim,
-      .partitioning = partitioning,
+      .prim = info.mode,
    };
 
-   if (with_counts) {
-      perf_debug(dev, "Tessellation with counts");
+   /* Generate counts */
+   key.mode = LIBAGX_TESS_MODE_COUNT;
+   {
+      struct hk_shader *tess =
+         hk_meta_kernel(dev, agx_nir_tessellate, &key, sizeof(key));
 
-      /* Generate counts */
-      key.mode = LIBAGX_TESS_MODE_COUNT;
-      {
-         struct hk_shader *tess =
-            hk_meta_kernel(dev, agx_nir_tessellate, &key, sizeof(key));
-
-         hk_dispatch_with_usc(
-            dev, cs, tess,
-            hk_upload_usc_words_kernel(cmd, tess, &state, sizeof(state)),
-            grid_tess, hk_grid(64, 1, 1));
-      }
-
-      /* Prefix sum counts, allocating index buffer space. */
-      {
-         struct hk_shader *sum =
-            hk_meta_kernel(dev, agx_nir_prefix_sum_tess, NULL, 0);
-
-         hk_dispatch_with_usc(
-            dev, cs, sum,
-            hk_upload_usc_words_kernel(cmd, sum, &state, sizeof(state)),
-            hk_grid(1024, 1, 1), hk_grid(1024, 1, 1));
-      }
-
-      key.mode = LIBAGX_TESS_MODE_WITH_COUNTS;
-   } else {
-      key.mode = LIBAGX_TESS_MODE_VDM;
+      hk_dispatch_with_usc(
+         dev, cs, tess,
+         hk_upload_usc_words_kernel(cmd, tess, &state, sizeof(state)),
+         grid_tess, hk_grid(64, 1, 1));
    }
+
+   /* Prefix sum counts, allocating index buffer space. */
+   {
+      struct hk_shader *sum =
+         hk_meta_kernel(dev, agx_nir_prefix_sum_tess, NULL, 0);
+
+      hk_dispatch_with_usc(
+         dev, cs, sum,
+         hk_upload_usc_words_kernel(cmd, sum, &state, sizeof(state)),
+         hk_grid(1024, 1, 1), hk_grid(1024, 1, 1));
+   }
+
+   key.mode = LIBAGX_TESS_MODE_WITH_COUNTS;
 
    /* Now we can tessellate */
    {
@@ -1658,10 +1723,8 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
       .range = dev->heap->size,
    };
 
-   struct hk_draw out = hk_draw_indexed_indirect(gfx->tess_out_draws, range,
-                                                 AGX_INDEX_SIZE_U32, false);
-   out.raw = !with_counts;
-   return out;
+   return hk_draw_indexed_indirect(gfx->tess.out_draws, range,
+                                   AGX_INDEX_SIZE_U32, false);
 }
 
 void
@@ -1683,59 +1746,15 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
    }
 }
 
-static uint32_t
-hk_pipeline_bind_group(gl_shader_stage stage)
-{
-   return stage;
-}
-
 static void
 hk_flush_shaders(struct hk_cmd_buffer *cmd)
 {
    if (cmd->state.gfx.shaders_dirty == 0)
       return;
 
-   /* Map shader types to shaders */
-   struct hk_api_shader *type_shader[6] = {
-      NULL,
-   };
-   uint32_t types_dirty = 0;
-
-   const uint32_t gfx_stages =
-      BITFIELD_BIT(MESA_SHADER_VERTEX) | BITFIELD_BIT(MESA_SHADER_TESS_CTRL) |
-      BITFIELD_BIT(MESA_SHADER_TESS_EVAL) | BITFIELD_BIT(MESA_SHADER_GEOMETRY) |
-      BITFIELD_BIT(MESA_SHADER_FRAGMENT);
-
    /* Geometry shading overrides the restart index, reemit on rebind */
    if (IS_SHADER_DIRTY(GEOMETRY)) {
       cmd->state.gfx.dirty |= HK_DIRTY_INDEX;
-   }
-
-   u_foreach_bit(stage, cmd->state.gfx.shaders_dirty & gfx_stages) {
-      /* TODO: compact? */
-      uint32_t type = stage;
-      types_dirty |= BITFIELD_BIT(type);
-
-      /* Only copy non-NULL shaders because mesh/task alias with vertex and
-       * tessellation stages.
-       */
-      if (cmd->state.gfx.shaders[stage] != NULL) {
-         assert(type < ARRAY_SIZE(type_shader));
-         assert(type_shader[type] == NULL);
-         type_shader[type] = cmd->state.gfx.shaders[stage];
-      }
-   }
-
-   u_foreach_bit(type, types_dirty) {
-      struct hk_api_shader *shader = type_shader[type];
-
-      /* We always map index == type */
-      // const uint32_t idx = type;
-
-      if (shader == NULL)
-         continue;
-
-      /* TODO */
    }
 
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -2058,9 +2077,6 @@ hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    /* Additionally clamp to the framebuffer so we don't rasterize
     * off-screen pixels. TODO: Is this necessary? the GL driver does this but
     * it might be cargoculted at this point.
-    *
-    * which is software-visible and can cause faults with
-    * eMRT when the framebuffer is not a multiple of the tile size.
     */
    for (unsigned i = 0; i < count; ++i) {
       minx[i] = MIN2(minx[i], cmd->state.gfx.render.cr.width);
@@ -2330,11 +2346,13 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       .output_select = hw_vs_dirty || linked_fs_dirty || varyings_dirty,
       .varying_counts_32 = varyings_dirty,
       .varying_counts_16 = varyings_dirty,
-      .cull =
-         IS_DIRTY(RS_CULL_MODE) || IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE) ||
-         IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE) ||
-         IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_LINE_MODE) ||
-         IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || (gfx->dirty & HK_DIRTY_PROVOKING),
+      .cull = IS_DIRTY(RS_CULL_MODE) ||
+              IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE) ||
+              IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE) ||
+              IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_LINE_MODE) ||
+              IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
+              (gfx->dirty & HK_DIRTY_PROVOKING) || IS_SHADER_DIRTY(TESS_CTRL) ||
+              IS_SHADER_DIRTY(TESS_EVAL) || IS_DIRTY(TS_DOMAIN_ORIGIN),
       .cull_2 = varyings_dirty,
 
       /* With a null FS, the fragment shader PPP word is ignored and doesn't
@@ -2408,8 +2426,8 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       }
    }
 
-   struct agx_fragment_face_packed fragment_face;
-   struct agx_fragment_face_2_packed fragment_face_2;
+   struct agx_fragment_face_packed fragment_face = {};
+   struct agx_fragment_face_2_packed fragment_face_2 = {};
 
    if (dirty.fragment_front_face) {
       bool has_z = render->depth_att.vk_format != VK_FORMAT_UNDEFINED;
@@ -2432,18 +2450,16 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    }
 
    if (dirty.fragment_front_face_2) {
-      agx_pack(&fragment_face_2, FRAGMENT_FACE_2, cfg) {
-         cfg.object_type = gfx->object_type;
+      if (fs) {
+         agx_pack(&fragment_face_2, FRAGMENT_FACE_2, cfg) {
+            cfg.object_type = gfx->object_type;
+         }
 
-         /* TODO: flip the default? */
-         if (fs)
-            cfg.conservative_depth = 0;
-      }
-
-      if (fs)
          agx_merge(fragment_face_2, fs->frag_face, FRAGMENT_FACE_2);
-
-      agx_ppp_push_packed(&ppp, &fragment_face_2, FRAGMENT_FACE_2);
+         agx_ppp_push_packed(&ppp, &fragment_face_2, FRAGMENT_FACE_2);
+      } else {
+         agx_ppp_fragment_face_2(&ppp, gfx->object_type, NULL);
+      }
    }
 
    if (dirty.fragment_front_stencil) {
@@ -2496,6 +2512,14 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          cfg.cull_front = dyn->rs.cull_mode & VK_CULL_MODE_FRONT_BIT;
          cfg.cull_back = dyn->rs.cull_mode & VK_CULL_MODE_BACK_BIT;
          cfg.front_face_ccw = dyn->rs.front_face != VK_FRONT_FACE_CLOCKWISE;
+
+         if (gfx->shaders[MESA_SHADER_TESS_CTRL] &&
+             !gfx->shaders[MESA_SHADER_GEOMETRY]) {
+            cfg.front_face_ccw ^= gfx->tess.info.ccw;
+            cfg.front_face_ccw ^= dyn->ts.domain_origin ==
+                                  VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+         }
+
          cfg.flat_shading_vertex = translate_ppp_vertex(gfx->provoking);
          cfg.rasterizer_discard = dyn->rs.rasterizer_discard_enable;
 
@@ -2517,6 +2541,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    if (dirty.cull_2) {
       agx_ppp_push(&ppp, CULL_2, cfg) {
          cfg.needs_primitive_id = gfx->generate_primitive_id;
+         cfg.clamp_w = true;
       }
    }
 
@@ -2641,7 +2666,9 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             (dev->vk.enabled_features.robustBufferAccess2 ||
              dev->vk.enabled_features.pipelineRobustness)
                ? AGX_ROBUSTNESS_D3D
-               : AGX_ROBUSTNESS_GL,
+            : dev->vk.enabled_features.robustBufferAccess
+               ? AGX_ROBUSTNESS_GL
+               : AGX_ROBUSTNESS_DISABLED,
 
          .prolog.robustness.soft_fault = agx_has_soft_fault(&dev->dev),
       };
@@ -2670,7 +2697,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             util_bitcount64(sw_vs->info.vs.attribs_read & BITFIELD_MASK(a));
 
          key.prolog.attribs[slot] = (struct agx_velem_key){
-            .format = vk_format_to_pipe_format(attr.format),
+            .format = hk_format_to_pipe_format(attr.format),
             .stride = dyn->vi_binding_strides[attr.binding],
             .divisor = binding.divisor,
             .instanced = binding.input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
@@ -2692,7 +2719,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             struct hk_addr_range vb = gfx->vb[attr.binding];
 
             desc->root.draw.attrib_clamps[slot] = agx_calculate_vbo_clamp(
-               vb.addr, sink, vk_format_to_pipe_format(attr.format), vb.range,
+               vb.addr, sink, hk_format_to_pipe_format(attr.format), vb.range,
                dyn->vi_binding_strides[attr.binding], attr.offset,
                &desc->root.draw.attrib_base[slot]);
          } else {
@@ -2716,15 +2743,25 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        IS_DIRTY(CB_BLEND_CONSTANTS) ||
        desc->root_dirty /* for pipeline stats */ || true) {
 
+      unsigned tib_sample_mask = BITFIELD_MASK(dyn->ms.rasterization_samples);
+      unsigned api_sample_mask = dyn->ms.sample_mask & tib_sample_mask;
+      bool has_sample_mask = api_sample_mask != tib_sample_mask;
+
+      if (hw_vs->info.vs.cull_distance_array_size) {
+         perf_debug(dev, "Emulating cull distance (size %u, %s a frag shader)",
+                    hw_vs->info.vs.cull_distance_array_size,
+                    fs ? "with" : "without");
+      }
+
+      if (has_sample_mask) {
+         perf_debug(dev, "Emulating sample mask (%s a frag shader)",
+                    fs ? "with" : "without");
+      }
+
       if (fs) {
          unsigned samples_shaded = 0;
          if (fs->info.fs.epilog_key.sample_shading)
             samples_shaded = dyn->ms.rasterization_samples;
-
-         unsigned tib_sample_mask =
-            BITFIELD_MASK(dyn->ms.rasterization_samples);
-         unsigned api_sample_mask = dyn->ms.sample_mask & tib_sample_mask;
-         bool has_sample_mask = api_sample_mask != tib_sample_mask;
 
          struct hk_fast_link_key_fs key = {
             .prolog.statistics = hk_pipeline_stat_addr(
@@ -2770,12 +2807,27 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                                      : PIPE_LOGICOP_COPY,
          };
 
+         for (unsigned rt = 0; rt < ARRAY_SIZE(dyn->cal.color_map); ++rt) {
+            int map = dyn->cal.color_map[rt];
+            key.epilog.remap[rt] = map == MESA_VK_ATTACHMENT_UNUSED ? -1 : map;
+         }
+
+         if (dyn->ms.alpha_to_one_enable || dyn->ms.alpha_to_coverage_enable ||
+             dyn->cb.logic_op_enable) {
+
+            perf_debug(
+               dev, "Epilog with%s%s%s",
+               dyn->ms.alpha_to_one_enable ? " alpha-to-one" : "",
+               dyn->ms.alpha_to_coverage_enable ? " alpha-to-coverage" : "",
+               dyn->cb.logic_op_enable ? " logic-op" : "");
+         }
+
          key.epilog.link.already_ran_zs |= nontrivial_force_early;
 
          struct hk_rendering_state *render = &cmd->state.gfx.render;
          for (uint32_t i = 0; i < render->color_att_count; i++) {
             key.epilog.rt_formats[i] =
-               vk_format_to_pipe_format(render->color_att[i].vk_format);
+               hk_format_to_pipe_format(render->color_att[i].vk_format);
 
             const struct vk_color_blend_attachment_state *cb =
                &dyn->cb.attachments[i];
@@ -2896,11 +2948,8 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (dyn->ms.rasterization_samples &&
        gfx->render.tilebuffer.nr_samples != dyn->ms.rasterization_samples) {
 
-      assert(gfx->render.tilebuffer.nr_samples == 0);
-
       unsigned nr_samples = MAX2(dyn->ms.rasterization_samples, 1);
-      gfx->render.tilebuffer.nr_samples = nr_samples;
-      agx_tilebuffer_pack_usc(&gfx->render.tilebuffer);
+      agx_tilebuffer_set_samples(&gfx->render.tilebuffer, nr_samples);
       cs->tib = gfx->render.tilebuffer;
    }
 
@@ -2992,8 +3041,10 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
+   struct agx_ptr tess_args = {0};
    if (gfx->shaders[MESA_SHADER_TESS_EVAL]) {
-      gfx->descriptors.root.draw.tess_params = hk_upload_tess_params(cmd, draw);
+      tess_args = hk_pool_alloc(cmd, sizeof(struct libagx_tess_args), 4);
+      gfx->descriptors.root.draw.tess_params = tess_args.gpu;
       gfx->descriptors.root_dirty = true;
    }
 
@@ -3011,6 +3062,18 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (gfx->descriptors.root_dirty) {
       gfx->root =
          hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+
+      /* Tess parameters depend on the root address, so we defer the upload
+       * until after uploading root. But the root depends on the tess address,
+       * so we allocate tess parameters before uploading root.
+       *
+       * This whole mechanism is a mess ported over from the GL driver. I'm
+       * planning to do a massive rework of indirect geom/tess so I'm trying not
+       * to perfectionism it in the mean time.
+       */
+      if (tess_args.cpu) {
+         hk_upload_tess_params(cmd, tess_args.cpu, draw);
+      }
    }
 
    /* Hardware dynamic state must be deferred until after the root and fast
@@ -3228,6 +3291,29 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    }
 #endif
 
+   /* Merge tess info before GS construction since that depends on
+    * gfx->tess.prim
+    */
+   if ((IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL)) &&
+       gfx->shaders[MESA_SHADER_TESS_CTRL]) {
+      struct hk_api_shader *tcs = gfx->shaders[MESA_SHADER_TESS_CTRL];
+      struct hk_api_shader *tes = gfx->shaders[MESA_SHADER_TESS_EVAL];
+      struct hk_shader *tese = hk_any_variant(tes);
+      struct hk_shader *tesc = hk_only_variant(tcs);
+
+      gfx->tess.info =
+         hk_tess_info_merge(tese->info.tess.info, tesc->info.tess.info);
+
+      /* Determine primitive based on the merged state */
+      if (gfx->tess.info.points) {
+         gfx->tess.prim = MESA_PRIM_POINTS;
+      } else if (gfx->tess.info.mode == TESS_PRIMITIVE_ISOLINES) {
+         gfx->tess.prim = MESA_PRIM_LINES;
+      } else {
+         gfx->tess.prim = MESA_PRIM_TRIANGLES;
+      }
+   }
+
    /* TODO: Try to reduce draw overhead of this */
    hk_handle_passthrough_gs(cmd, draw);
 
@@ -3381,6 +3467,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct hk_draw draw_)
       cmd, VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT);
 
    bool ia_stats = stat_ia_verts || stat_vs_inv;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    hk_foreach_view(cmd) {
       struct hk_draw draw = draw_;
@@ -3397,6 +3484,11 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct hk_draw draw_)
       uint8_t *out = cs->current;
       assert(cs->current + 0x1000 < cs->end);
 
+      if (tess && HK_PERF(dev, NOTESS))
+         continue;
+
+      cs->stats.calls++;
+
       if (geom || tess || ia_stats) {
          ccs =
             hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
@@ -3410,20 +3502,6 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct hk_draw draw_)
 
       if (tess) {
          draw = hk_launch_tess(cmd, ccs, draw);
-
-         if (draw.raw) {
-            assert(!geom);
-            assert(draw.b.indirect);
-
-            agx_push(out, VDM_STREAM_LINK, cfg) {
-               cfg.target_lo = draw.b.ptr & BITFIELD_MASK(32);
-               cfg.target_hi = draw.b.ptr >> 32;
-               cfg.with_return = true;
-            }
-
-            cs->current = out;
-            continue;
-         }
       }
 
       if (geom) {
@@ -3495,6 +3573,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct hk_draw draw_)
       }
 
       cs->current = out;
+      cs->stats.cmds++;
    }
 }
 
@@ -3503,12 +3582,24 @@ hk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
            uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_draw draw;
 
-   struct hk_draw draw = {
-      .b = hk_grid(vertexCount, instanceCount, 1),
-      .start = firstVertex,
-      .start_instance = firstInstance,
-   };
+   if (HK_TEST_INDIRECTS) {
+      uint32_t data[] = {
+         vertexCount,
+         instanceCount,
+         firstVertex,
+         firstInstance,
+      };
+
+      draw = hk_draw_indirect(hk_pool_upload(cmd, data, sizeof(data), 4));
+   } else {
+      draw = (struct hk_draw){
+         .b = hk_grid(vertexCount, instanceCount, 1),
+         .start = firstVertex,
+         .start_instance = firstInstance,
+      };
+   }
 
    hk_draw(cmd, 0, draw);
 }
@@ -3540,15 +3631,25 @@ hk_draw_indexed(VkCommandBuffer commandBuffer, uint16_t draw_id,
                 uint32_t firstInstance)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_draw draw;
 
-   struct hk_draw draw = {
-      .b = hk_grid(indexCount, instanceCount, 1),
-      .indexed = true,
-      .index = cmd->state.gfx.index.buffer,
-      .start = firstIndex,
-      .index_bias = vertexOffset,
-      .start_instance = firstInstance,
-   };
+   if (HK_TEST_INDIRECTS && draw_id == 0) {
+      uint32_t data[] = {
+         indexCount, instanceCount, firstIndex, vertexOffset, firstInstance,
+      };
+      uint64_t addr = hk_pool_upload(cmd, data, sizeof(data), 4);
+
+      draw = hk_draw_indexed_indirect(addr, cmd->state.gfx.index.buffer, 0, 0);
+   } else {
+      draw = (struct hk_draw){
+         .b = hk_grid(indexCount, instanceCount, 1),
+         .indexed = true,
+         .index = cmd->state.gfx.index.buffer,
+         .start = firstIndex,
+         .index_bias = vertexOffset,
+         .start_instance = firstInstance,
+      };
+   }
 
    hk_draw(cmd, draw_id, draw);
 }

@@ -756,7 +756,7 @@ translate_systolic_depth(unsigned d)
 
 int
 fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
-                            struct shader_stats shader_stats,
+                            struct brw_shader_stats shader_stats,
                             const brw::performance &perf,
                             struct brw_compile_stats *stats,
                             unsigned max_polygons)
@@ -773,6 +773,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 
    struct disasm_info *disasm_info = disasm_initialize(p->isa, cfg);
 
+   enum opcode prev_opcode = BRW_OPCODE_ILLEGAL;
    foreach_block_and_inst (block, fs_inst, inst, cfg) {
       if (inst->opcode == SHADER_OPCODE_UNDEF)
          continue;
@@ -1084,9 +1085,16 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 	 break;
 
       case BRW_OPCODE_WHILE:
-	 brw_WHILE(p);
+         /* On LNL and newer, if we don't put a NOP in between two consecutive
+          * WHILE instructions we may end up with misrendering or GPU hangs.
+          * See HSD 22020521218.
+          */
+         if (devinfo->ver >= 20 && unlikely(prev_opcode == BRW_OPCODE_WHILE))
+            brw_NOP(p);
+
+         brw_WHILE(p);
          loop_count++;
-	 break;
+         break;
 
       case SHADER_OPCODE_RCP:
       case SHADER_OPCODE_RSQ:
@@ -1354,6 +1362,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       case SHADER_OPCODE_LOAD_PAYLOAD:
          unreachable("Should be lowered by lower_load_payload()");
       }
+      prev_opcode = inst->opcode;
 
       if (multiple_instructions_emitted)
          continue;
@@ -1430,15 +1439,18 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
               "%d:%d spills:fills, %u sends, "
               "scheduled with mode %s. "
               "Promoted %u constants. "
+              "Non-SSA regs (after NIR): %u. "
               "Compacted %d to %d bytes (%.0f%%)\n",
               shader_name, params->source_hash, sha1buf,
-              dispatch_width, before_size / 16,
+              dispatch_width,
+              before_size / 16 - nop_count - sync_nop_count,
               loop_count, perf.latency,
               shader_stats.spill_count,
               shader_stats.fill_count,
               send_count,
               shader_stats.scheduler_mode,
               shader_stats.promoted_constants,
+              shader_stats.non_ssa_registers_after_nir,
               before_size, after_size,
               100.0f * (before_size - after_size) / before_size);
 
@@ -1486,6 +1498,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       stats->spills = shader_stats.spill_count;
       stats->fills = shader_stats.fill_count;
       stats->max_live_registers = shader_stats.max_register_pressure;
+      stats->non_ssa_registers_after_nir = shader_stats.non_ssa_registers_after_nir;
    }
 
    return start_offset;

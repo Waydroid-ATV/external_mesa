@@ -764,6 +764,7 @@ static d3d12_video_encode_get_h264_codec_support(const D3D12_VIDEO_ENCODER_PROFI
    return true;
 }
 
+#if VIDEO_CODEC_H265ENC
 bool
 static d3d12_video_encode_get_hevc_codec_support ( const D3D12_VIDEO_ENCODER_CODEC &argCodec,
                                                    const D3D12_VIDEO_ENCODER_PROFILE_DESC &argTargetProfile,
@@ -837,6 +838,7 @@ static d3d12_video_encode_get_hevc_codec_support ( const D3D12_VIDEO_ENCODER_COD
    memset(&supportedCaps, 0, sizeof(D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC));
    return false;
 }
+#endif // VIDEO_CODEC_H265ENC
 
 static bool
 d3d12_has_video_encode_support(struct pipe_screen *pscreen,
@@ -1787,8 +1789,6 @@ d3d12_screen_get_video_param_encode(struct pipe_screen *pscreen,
    struct d3d12_encode_codec_support codec_specific_support;
    memset(&codec_specific_support, 0, sizeof(codec_specific_support));
    switch (param) {
-      case PIPE_VIDEO_CAP_ENC_SUPPORTS_ASYNC_OPERATION:
-         return D3D12_VIDEO_ENC_ASYNC;
       case PIPE_VIDEO_CAP_REQUIRES_FLUSH_ON_END_FRAME:
          return 1;
       case PIPE_VIDEO_CAP_NPOT_TEXTURES:

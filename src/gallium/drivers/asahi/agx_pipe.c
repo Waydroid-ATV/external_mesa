@@ -87,21 +87,6 @@ void agx_init_state_functions(struct pipe_context *ctx);
  * resource
  */
 
-static enum ail_tiling
-ail_modifier_to_tiling(uint64_t modifier)
-{
-   switch (modifier) {
-   case DRM_FORMAT_MOD_LINEAR:
-      return AIL_TILING_LINEAR;
-   case DRM_FORMAT_MOD_APPLE_TWIDDLED:
-      return AIL_TILING_TWIDDLED;
-   case DRM_FORMAT_MOD_APPLE_TWIDDLED_COMPRESSED:
-      return AIL_TILING_TWIDDLED_COMPRESSED;
-   default:
-      unreachable("Unsupported modifier");
-   }
-}
-
 const static char *s_tiling[] = {
    [AIL_TILING_LINEAR] = "LINR",
    [AIL_TILING_TWIDDLED] = "TWID",
@@ -159,7 +144,7 @@ agx_resource_setup(struct agx_device *dev, struct agx_resource *nresource)
    struct pipe_resource *templ = &nresource->base;
 
    nresource->layout = (struct ail_layout){
-      .tiling = ail_modifier_to_tiling(nresource->modifier),
+      .tiling = ail_drm_modifier_to_tiling(nresource->modifier),
       .mipmapped_z = templ->target == PIPE_TEXTURE_3D,
       .format = templ->format,
       .width_px = templ->width0,
@@ -2106,8 +2091,8 @@ agx_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_TEXTURE_BUFFER_OFFSET_ALIGNMENT:
       return 64;
 
-   case PIPE_CAP_VERTEX_ATTRIB_ELEMENT_ALIGNED_ONLY:
-      return 1;
+   case PIPE_CAP_VERTEX_INPUT_ALIGNMENT:
+      return PIPE_VERTEX_INPUT_ALIGNMENT_ELEMENT;
 
    case PIPE_CAP_QUERY_PIPELINE_STATISTICS_SINGLE:
       return true;
@@ -2651,6 +2636,19 @@ agx_screen_get_driver_uuid(struct pipe_screen *pscreen, char *uuid)
    agx_get_driver_uuid(uuid);
 }
 
+static const char *
+agx_get_cl_cts_version(struct pipe_screen *pscreen)
+{
+   struct agx_device *dev = agx_device(pscreen);
+
+   /* https://www.khronos.org/conformance/adopters/conformant-products/opencl#submission_433
+    */
+   if (dev->params.gpu_generation < 15)
+      return "v2024-08-08-00";
+
+   return NULL;
+}
+
 struct pipe_screen *
 agx_screen_create(int fd, struct renderonly *ro,
                   const struct pipe_screen_config *config)
@@ -2675,10 +2673,6 @@ agx_screen_create(int fd, struct renderonly *ro,
    driParseConfigFiles(config->options, config->options_info, 0, "asahi", NULL,
                        NULL, NULL, 0, NULL, 0);
 
-   /* Forward no16 flag from driconf */
-   if (driQueryOptionb(config->options, "no_fp16"))
-      agx_screen->dev.debug |= AGX_DBG_NO16;
-
    agx_screen->dev.fd = fd;
    agx_screen->dev.ro = ro;
    u_rwlock_init(&agx_screen->destroy_lock);
@@ -2688,6 +2682,12 @@ agx_screen_create(int fd, struct renderonly *ro,
       ralloc_free(agx_screen);
       return NULL;
    }
+
+   /* Forward no16 flag from driconf. This must happen after opening the device,
+    * since agx_open_device sets debug.
+    */
+   if (driQueryOptionb(config->options, "no_fp16"))
+      agx_screen->dev.debug |= AGX_DBG_NO16;
 
    int ret =
       drmSyncobjCreate(agx_device(screen)->fd, 0, &agx_screen->flush_syncobj);
@@ -2721,6 +2721,7 @@ agx_screen_create(int fd, struct renderonly *ro,
    screen->fence_get_fd = agx_fence_get_fd;
    screen->get_compiler_options = agx_get_compiler_options;
    screen->get_disk_shader_cache = agx_get_disk_shader_cache;
+   screen->get_cl_cts_version = agx_get_cl_cts_version;
 
    screen->resource_create = u_transfer_helper_resource_create;
    screen->resource_destroy = u_transfer_helper_resource_destroy;

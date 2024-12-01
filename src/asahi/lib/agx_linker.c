@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "util/ralloc.h"
+#include "agx_abi.h"
 #include "agx_compile.h"
 #include "agx_device.h"
 #include "agx_pack.h"
@@ -28,10 +29,15 @@
  * following binary sequences form the relevant loop.
  */
 
+static_assert(AGX_ABI_FIN_SAMPLE_MASK == 2, "r1l known");
+
 /* clang-format off */
 static const uint8_t sample_loop_header[] = {
-   /* mov_imm r0, 0x10000, 0b0 */
-   0x62, 0x01, 0x00, 0x00, 0x01, 0x00,
+   /* mov_imm r0l, 0x0, 0b0 */
+   0x62, 0x00, 0x00, 0x00,
+
+   /* mov_imm r1l, 0x0, 0b0 */
+   0x62, 0x04, 0x01, 0x00,
 };
 
 #define STOP                                                                   \
@@ -45,11 +51,11 @@ static const uint8_t sample_loop_header[] = {
 static const uint8_t stop[] = {STOP};
 
 static const uint8_t sample_loop_footer[] = {
-   /* iadd r0h, 0, r0h, lsl 1 */
-   0x0e, 0x02, 0x00, 0x10, 0x84, 0x00, 0x00, 0x00,
+   /* iadd r1l, 0, r1l, lsl 1 */
+   0x0e, 0x04, 0x00, 0x20, 0x84, 0x00, 0x00, 0x00,
 
-   /* while_icmp r0l, ult, r0h, 0, 1 */
-   0x52, 0x2c, 0x41, 0x00, 0x00, 0x00,
+   /* while_icmp r0l, ult, r1h, 0, 1 */
+   0x52, 0x2c, 0x42, 0x00, 0x00, 0x00,
 
    /* jmp_exec_any */
    0x00, 0xc0, 0x00, 0x00, 0x00, 0x00,
@@ -100,7 +106,6 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       if (!part)
          continue;
 
-      assert(part->info.main_offset == 0);
       size += part->info.main_size;
 
       nr_gprs = MAX2(nr_gprs, part->info.nr_gprs);
@@ -142,7 +147,8 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          continue;
 
       size_t sz = part->info.main_size;
-      memcpy((uint8_t *)linked->bo->map + offset, part->binary, sz);
+      memcpy((uint8_t *)linked->bo->map + offset,
+             part->binary + part->info.main_offset, sz);
       offset += sz;
    }
 
@@ -187,11 +193,14 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       cfg.register_count = nr_gprs;
       cfg.unk_1 = fragment;
       cfg.spill_size = scratch_size ? agx_scratch_get_bucket(scratch_size) : 0;
+      cfg.unk_4 = 1;
    }
 
    if (fragment) {
       agx_pack(&linked->fragment_props, USC_FRAGMENT_PROPERTIES, cfg) {
          cfg.early_z_testing = !writes_sample_mask;
+         cfg.unk_2 = true;
+         cfg.unk_3 = 0xf;
          cfg.unk_4 = 0x2;
          cfg.unk_5 = 0x0;
       }

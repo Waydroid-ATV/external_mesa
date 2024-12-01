@@ -19,7 +19,7 @@ project(
 
 if host_machine.system() == 'darwin'
   add_languages('objc', native : false)
-  add_global_arguments('-fobjc-arc', language : 'objc')
+  add_project_arguments('-fobjc-arc', language : 'objc')
 endif
 
 cc = meson.get_compiler('c')
@@ -242,7 +242,7 @@ elif _vulkan_drivers.contains('all')
    _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'swrast',
                       'freedreno', 'panfrost', 'virtio', 'broadcom',
                       'imagination-experimental', 'microsoft-experimental',
-                      'nouveau', 'asahi']
+                      'nouveau', 'asahi', 'gfxstream-experimental']
 endif
 
 with_intel_vk = _vulkan_drivers.contains('intel')
@@ -258,6 +258,7 @@ with_imagination_srv = get_option('imagination-srv')
 with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
 with_nouveau_vk = _vulkan_drivers.contains('nouveau')
 with_asahi_vk = _vulkan_drivers.contains('asahi')
+with_gfxstream_vk = _vulkan_drivers.contains('gfxstream-experimental')
 with_any_vk = _vulkan_drivers.length() != 0
 
 if with_any_vk and host_machine.system() == 'windows' and meson.version().version_compare('< 1.3')
@@ -491,6 +492,7 @@ if with_platform_android and get_option('platform-sdk-version') >= 29
   # ELF TLS, even when building targeting newer API levels.  Make it actually do
   # ELF TLS instead.
   c_cpp_args += '-fno-emulated-tls'
+  add_project_link_arguments('-Wl,-plugin-opt=-emulated-tls=0', language: ['c', 'cpp'])
 endif
 
 # -mtls-dialect=gnu2 speeds up non-initial-exec TLS significantly but requires
@@ -857,11 +859,13 @@ if with_libbacktrace
 endif
 
 if with_platform_android
+  dep_android_ui = null_dep
   dep_android_mapper4 = null_dep
   if not with_android_stub
     dep_android = [
       dependency('cutils'),
       dependency('hardware'),
+      dependency('log'),
       dependency('sync'),
     ]
     if with_libbacktrace
@@ -872,6 +876,9 @@ if with_platform_android
     endif
     if get_option('platform-sdk-version') >= 30
       dep_android_mapper4 = dependency('android.hardware.graphics.mapper', version : '>= 4.0', required : false)
+    endif
+    if get_option('platform-sdk-version') >= 35
+      dep_android_ui = dependency('ui', required : false)
     endif
   endif
   pre_args += '-DANDROID_API_LEVEL=' + get_option('platform-sdk-version').to_string()
@@ -1840,14 +1847,14 @@ endif
 dep_spirv_tools = dependency(
   'SPIRV-Tools',
   required : with_clover_spirv or with_clc,
-  version : '>= 2018.0'
+  version : '>= 2022.1'
 )
 if dep_spirv_tools.found()
   pre_args += '-DHAVE_SPIRV_TOOLS'
 endif
 
 dep_clang = null_dep
-if with_clc
+if with_clc or with_gallium_clover
   llvm_libdir = dep_llvm.get_variable(cmake : 'LLVM_LIBRARY_DIR', configtool: 'libdir')
 
   dep_clang = cpp.find_library('clang-cpp', dirs : llvm_libdir, required : false)
@@ -1862,7 +1869,7 @@ if with_clc
     if dep_llvm.version().version_compare('>= 15.0')
       clang_modules += 'clangSupport'
     endif
-    if dep_llvm.version().version_compare('>= 16.0')
+    if dep_llvm.version().version_compare('>= 16.0') or with_gallium_clover
       clang_modules += 'clangASTMatchers'
     endif
     if dep_llvm.version().version_compare('>= 18.0')
@@ -1979,12 +1986,6 @@ else
   prog_flex_cpp = prog_flex
 endif
 
-dep_selinux = null_dep
-if get_option('selinux')
-  dep_selinux = dependency('libselinux')
-  pre_args += '-DMESA_SELINUX'
-endif
-
 _libunwind = get_option('libunwind') \
   .require(not with_platform_android, error_message : 'Android requires the use of the backtrace library, not libunwind')
 if host_machine.system() == 'darwin'
@@ -2017,7 +2018,7 @@ if with_platform_wayland
   else
     wl_scanner_arg = 'code'
   endif
-  dep_wl_protocols = dependency('wayland-protocols', version : '>= 1.34')
+  dep_wl_protocols = dependency('wayland-protocols', version : '>= 1.38', default_options: [ 'tests=false' ])
   dep_wayland_client = dependency('wayland-client', version : '>=1.18')
   dep_wayland_server = dependency('wayland-server', version : '>=1.18')
   if with_egl
@@ -2051,7 +2052,6 @@ dep_xcb_dri3 = null_dep
 dep_dri2proto = null_dep
 dep_glproto = null_dep
 dep_xxf86vm = null_dep
-dep_xcb_dri3 = null_dep
 dep_xcb_present = null_dep
 dep_xcb_sync = null_dep
 dep_xcb_xfixes = null_dep
@@ -2127,9 +2127,16 @@ if with_platform_x11
     endif
   endif
   if (with_egl or
+      with_dri or
       with_any_vk or
       with_gallium_vdpau or with_gallium_xa)
     dep_xcb_xfixes = dependency('xcb-xfixes')
+  endif
+  if with_any_vk
+    dep_xcb_dri3 = dependency('xcb-dri3', version : '>= 1.13')
+    dep_xcb_present = dependency('xcb-present', version : '>= 1.13')
+    dep_xcb_shm = dependency('xcb-shm')
+    dep_xshmfence = dependency('xshmfence', version : '>= 1.1')
   endif
   if with_xlib_lease or with_any_vk
     dep_xcb_xrandr = dependency('xcb-randr')

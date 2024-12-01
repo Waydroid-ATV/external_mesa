@@ -6,6 +6,23 @@
 #include "panvk_cmd_meta.h"
 #include "panvk_entrypoints.h"
 
+static bool
+copy_to_image_use_gfx_pipeline(struct panvk_device *dev,
+                               struct panvk_image *dst_img)
+{
+   struct panvk_instance *instance =
+      to_panvk_instance(dev->vk.physical->instance);
+
+   if (instance->debug_flags & PANVK_DEBUG_COPY_GFX)
+      return true;
+
+   /* Writes to AFBC images must go through the graphics pipeline. */
+   if (drm_is_afbc(dst_img->pimage.layout.modifier))
+      return true;
+
+   return false;
+}
+
 void
 panvk_per_arch(cmd_meta_compute_start)(
    struct panvk_cmd_buffer *cmdbuf,
@@ -54,6 +71,10 @@ panvk_per_arch(cmd_meta_compute_end)(
 
    cmdbuf->state.compute.shader = save_ctx->cs.shader;
    cmdbuf->state.compute.cs.desc = save_ctx->cs.desc;
+
+#if PAN_ARCH >= 9
+   cmdbuf->state.compute.cs.desc.res_table = 0;
+#endif
 }
 
 void
@@ -119,6 +140,9 @@ panvk_per_arch(cmd_meta_gfx_end)(
    cmdbuf->state.gfx.vs.attribs = 0;
    cmdbuf->state.gfx.vs.attrib_bufs = 0;
    cmdbuf->state.gfx.fs.rsd = 0;
+#else
+   cmdbuf->state.gfx.fs.desc.res_table = 0;
+   cmdbuf->state.gfx.vs.desc.res_table = 0;
 #endif
 
    cmdbuf->vk.dynamic_graphics_state = save_ctx->dyn_state.all;
@@ -170,29 +194,16 @@ panvk_per_arch(CmdClearAttachments)(VkCommandBuffer commandBuffer,
       .view_mask = 0,
       .samples = fbinfo->nr_samples,
       .color_attachment_count = fbinfo->rt_count,
+      .depth_attachment_format = cmdbuf->state.gfx.render.z_attachment.fmt,
+      .stencil_attachment_format = cmdbuf->state.gfx.render.s_attachment.fmt,
    };
 
-   for (uint32_t i = 0; i < fbinfo->rt_count; i++) {
-      if (fbinfo->rts[i].view) {
-         render.color_attachment_formats[i] =
-            cmdbuf->state.gfx.render.color_attachments.fmts[i];
-         render.color_attachment_write_masks[i] =
-            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-      }
-   }
-
-   if (fbinfo->zs.view.zs) {
-      render.depth_attachment_format =
-         vk_format_from_pipe_format(fbinfo->zs.view.zs->format);
-
-      if (vk_format_has_stencil(render.depth_attachment_format))
-         render.stencil_attachment_format = render.depth_attachment_format;
-   }
-
-   if (fbinfo->zs.view.s) {
-      render.stencil_attachment_format =
-         vk_format_from_pipe_format(fbinfo->zs.view.s->format);
+   for (uint32_t i = 0; i < render.color_attachment_count; i++) {
+       render.color_attachment_formats[i] =
+          cmdbuf->state.gfx.render.color_attachments.fmts[i];
+       render.color_attachment_write_masks[i] =
+          VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
    }
 
    panvk_per_arch(cmd_meta_gfx_start)(cmdbuf, &save);
@@ -260,7 +271,7 @@ panvk_per_arch(CmdCopyBufferToImage2)(
    VK_FROM_HANDLE(panvk_image, img, pCopyBufferToImageInfo->dstImage);
    struct vk_meta_copy_image_properties img_props =
       panvk_meta_copy_get_image_properties(img);
-   bool use_gfx_pipeline = panvk_meta_copy_to_image_use_gfx_pipeline(img);
+   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, img);
 
    if (use_gfx_pipeline) {
       struct panvk_cmd_meta_graphics_save_ctx save = {0};
@@ -341,7 +352,7 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
       panvk_meta_copy_get_image_properties(src_img);
    struct vk_meta_copy_image_properties dst_img_props =
       panvk_meta_copy_get_image_properties(dst_img);
-   bool use_gfx_pipeline = panvk_meta_copy_to_image_use_gfx_pipeline(dst_img);
+   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, dst_img);
 
    if (use_gfx_pipeline) {
       struct panvk_cmd_meta_graphics_save_ctx save = {0};

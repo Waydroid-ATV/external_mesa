@@ -3,14 +3,15 @@
   extends: .container+build-rules
   # Cancel job if a newer commit is pushed to the same branch
   interruptible: true
-  # Build jobs don't take more than 1-3 minutes. 5-8 min max on a fresh runner
-  # without a populated ccache.
-  # These jobs are never slow, either they finish within reasonable time or
-  # something has gone wrong and the job will never terminate, so we should
-  # instead timeout so that the retry mechanism can kick in.
-  # A few exception are made, see `timeout:` overrides in the rest of this
-  # file.
-  timeout: 30m
+  variables:
+    # Build jobs don't take more than 1-3 minutes. 5-8 min max on a fresh runner
+    # without a populated ccache.
+    # These jobs are never slow, either they finish within reasonable time or
+    # something has gone wrong and the job will never terminate, so we should
+    # instead timeout so that the retry mechanism can kick in.
+    # A few exception are made, see overrides in the rest of this file.
+    BUILD_JOB_TIMEOUT: 15m
+  timeout: 1h
   # We don't want to download any previous job's artifacts
   dependencies: []
   artifacts:
@@ -60,15 +61,18 @@
   variables:
     LLVM_VERSION: 15
   script:
-    - .gitlab-ci/meson/build.sh
+    - &meson-build timeout --verbose ${BUILD_JOB_TIMEOUT_OVERRIDE:-$BUILD_JOB_TIMEOUT} .gitlab-ci/meson/build.sh
 
 
 # Make sure this list stays the same as all the jobs with
-# `stage: build-for-tests`
+# `stage: build-for-tests`, except for the windows job as
+# explained below.
 .build-for-tests-jobs:
   - job: debian-testing
     optional: true
   - job: debian-testing-asan
+    optional: true
+  - job: debian-build-testing
     optional: true
   - job: debian-arm32
     optional: true
@@ -78,8 +82,10 @@
     optional: true
   - job: debian-arm64-asan
     optional: true
-  - job: windows-msvc
-    optional: true
+  # Windows runners don't have more than one build right now, so there is
+  # no need to wait on the "first one" to be done.
+  # - job: windows-msvc
+  #   optional: true
   - job: python-test
     optional: true
 
@@ -90,6 +96,7 @@ debian-testing:
     - .ci-deqp-artifacts
   stage: build-for-tests
   variables:
+    BUILD_JOB_TIMEOUT: 30m
     UNWIND: "enabled"
     DRI_LOADERS: >
       -D glx=dri
@@ -112,7 +119,7 @@ debian-testing:
     S3_ARTIFACT_NAME: mesa-x86_64-default-${BUILDTYPE}
     LLVM_VERSION: 15
   script:
-    - .gitlab-ci/meson/build.sh
+    - *meson-build
     - .gitlab-ci/prepare-artifacts.sh
   artifacts:
     reports:
@@ -123,6 +130,7 @@ debian-testing-asan:
     - debian-testing
   stage: build-for-tests
   variables:
+    BUILD_JOB_TIMEOUT: 30m
     C_ARGS: >
       -Wno-error=stringop-truncation
     EXTRA_OPTION: >
@@ -153,6 +161,7 @@ debian-testing-msan:
     - debian-clang
   # `needs:` inherited from debian-clang
   variables:
+    BUILD_JOB_TIMEOUT: 30m
     # l_undef is incompatible with msan
     EXTRA_OPTION:
       -D b_sanitize=memory
@@ -182,9 +191,7 @@ debian-testing-msan:
 
 debian-build-testing:
   extends: .meson-build
-  needs:
-    - !reference [.meson-build, needs]
-    - !reference [.build-for-tests-jobs]
+  stage: build-for-tests
   variables:
     BUILDTYPE: debug
     UNWIND: "enabled"
@@ -209,16 +216,29 @@ debian-build-testing:
       -D tools=drm-shim,etnaviv,freedreno,glsl,intel,intel-ui,nir,nouveau,lima,panfrost,asahi
     LLVM_VERSION: 15
     S3_ARTIFACT_NAME: debian-build-testing
-  script: |
-    .gitlab-ci/meson/build.sh
-    .gitlab-ci/prepare-artifacts.sh
-  timeout: 15m
+  script:
+    - *meson-build
+    - .gitlab-ci/prepare-artifacts.sh
 
 shader-db:
   stage: code-validation
   extends:
     - .use-debian/x86_64_build
-    - .container+build-rules
+  rules:
+    - !reference [.never-post-merge-rules, rules]
+    - !reference [.core-rules, rules]
+    # Keep this list in sync with the drivers tested in run-shader-db.sh
+    - !reference [.freedreno-common-rules, rules]
+    - !reference [.intel-common-rules, rules]
+    - !reference [.lima-rules, rules]
+    - !reference [.v3d-rules, rules]
+    - !reference [.vc4-rules, rules]
+    - !reference [.nouveau-rules, rules]
+    - !reference [.r300-rules, rules]
+    # Also run if this job's own config or script changes
+    - changes:
+        - .gitlab-ci/build/gitlab-ci.yml
+        - .gitlab-ci/run-shader-db.sh
   needs:
     - debian-build-testing
   variables:
@@ -269,7 +289,7 @@ debian-release:
     BUILDTYPE: "release"
     S3_ARTIFACT_NAME: "mesa-x86_64-default-${BUILDTYPE}"
   script:
-    - .gitlab-ci/meson/build.sh
+    - *meson-build
     - 'if [ -n "$MESA_CI_PERFORMANCE_ENABLED" ]; then .gitlab-ci/prepare-artifacts.sh; fi'
 
 alpine-build-testing:
@@ -280,10 +300,12 @@ alpine-build-testing:
     - !reference [.use-alpine/x86_64_build, needs]
     - !reference [.build-for-tests-jobs]
   variables:
+    BUILD_JOB_TIMEOUT: 30m
     BUILDTYPE: "release"
     C_ARGS: >
       -Wno-error=cpp
       -Wno-error=array-bounds
+      -Wno-error=stringop-overflow
       -Wno-error=stringop-overread
     DRI_LOADERS: >
       -D glx=disabled
@@ -317,12 +339,17 @@ fedora-release:
     - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: "release"
-    C_LINK_ARGS: >
+    # array-bounds are pure non-LTO gcc buggy warning, verify after bump to F39
+    C_ARGS: >
       -Wno-error=stringop-overflow
       -Wno-error=stringop-overread
+      -Wno-error=array-bounds
     CPP_ARGS: >
       -Wno-error=dangling-reference
       -Wno-error=overloaded-virtual
+    C_LINK_ARGS: >
+      -Wno-error=stringop-overflow
+      -Wno-error=stringop-overread
     CPP_LINK_ARGS: >
       -Wno-error=stringop-overflow
       -Wno-error=stringop-overread
@@ -333,9 +360,7 @@ fedora-release:
       -D glvnd=enabled
       -D platforms=x11,wayland
     EXTRA_OPTION: >
-      -D b_lto=true
       -D osmesa=true
-      -D selinux=true
       -D tools=drm-shim,etnaviv,freedreno,glsl,intel,nir,nouveau,lima,panfrost,imagination
       -D vulkan-layers=device-select,overlay
       -D intel-rt=enabled
@@ -415,13 +440,19 @@ debian-android:
     ARTIFACTS_DEBUG_SYMBOLS: 1
     S3_ARTIFACT_NAME: mesa-x86_64-android-${BUILDTYPE}
   script:
-    - CROSS=aarch64-linux-android GALLIUM_DRIVERS=etnaviv,freedreno,lima,panfrost,vc4,v3d VULKAN_DRIVERS=freedreno,broadcom,virtio .gitlab-ci/meson/build.sh
+    - export CROSS=aarch64-linux-android
+    - export GALLIUM_DRIVERS=etnaviv,freedreno,lima,panfrost,vc4,v3d
+    - export VULKAN_DRIVERS=freedreno,broadcom,virtio
+    - *meson-build
     # x86_64 build:
     # Can't do Intel because gen_decoder.c currently requires libexpat, which
     # is not a dependency that AOSP wants to accept.  Can't do Radeon Gallium
     # drivers because they requires LLVM, which we don't have an Android build
     # of.
-    - CROSS=x86_64-linux-android GALLIUM_DRIVERS=iris,virgl VULKAN_DRIVERS=amd,intel .gitlab-ci/meson/build.sh
+    - export CROSS=x86_64-linux-android
+    - export GALLIUM_DRIVERS=iris,virgl
+    - export VULKAN_DRIVERS=amd,intel
+    - *meson-build
     - .gitlab-ci/prepare-artifacts.sh
 
 .meson-cross:
@@ -474,7 +505,7 @@ debian-arm32:
     # tempfiles in our artifacts.
     ARTIFACTS_DEBUG_SYMBOLS: 1
   script:
-    - .gitlab-ci/meson/build.sh
+    - *meson-build
     - .gitlab-ci/prepare-artifacts.sh
 
 debian-arm32-asan:
@@ -515,7 +546,7 @@ debian-arm64:
       -D gallium-rusticl=true
     S3_ARTIFACT_NAME: mesa-arm64-default-${BUILDTYPE}
   script:
-    - .gitlab-ci/meson/build.sh
+    - *meson-build
     - .gitlab-ci/prepare-artifacts.sh
 
 debian-arm64-asan:
@@ -562,8 +593,29 @@ debian-arm64-release:
       -Wno-error=stringop-truncation
       -Wno-error=stringop-overread
   script:
-    - .gitlab-ci/meson/build.sh
+    - *meson-build
     - 'if [ -n "$MESA_CI_PERFORMANCE_ENABLED" ]; then .gitlab-ci/prepare-artifacts.sh; fi'
+
+debian-no-libdrm:
+  extends:
+    - .meson-arm
+  stage: build-only
+  needs:
+    - !reference [.meson-arm, needs]
+    - !reference [.build-for-tests-jobs]
+  variables:
+    VULKAN_DRIVERS: freedreno
+    GALLIUM_DRIVERS: "zink,llvmpipe"
+    BUILDTYPE: release
+    C_ARGS: >
+      -Wno-error=array-bounds
+      -Wno-error=stringop-truncation
+      -Wno-error=stringop-overread
+    EXTRA_OPTION: >
+      -D freedreno-kmds=kgsl
+      -D glx=disabled
+      -D gbm=disabled
+      -D egl=disabled
 
 debian-clang:
   extends: .meson-build
@@ -624,6 +676,7 @@ debian-clang-release:
   extends: debian-clang
   # `needs:` inherited from debian-clang
   variables:
+    BUILD_JOB_TIMEOUT: 30m
     BUILDTYPE: "release"
     DRI_LOADERS: >
       -D glx=xlib
@@ -661,6 +714,7 @@ debian-vulkan:
     - !reference [.meson-build, needs]
     - !reference [.build-for-tests-jobs]
   variables:
+    BUILD_JOB_TIMEOUT: 30m
     BUILDTYPE: debug
     LLVM_VERSION: 15
     UNWIND: "disabled"
@@ -760,7 +814,7 @@ debian-ppc64el:
 # This job tests our Python scripts, and also emits our scripts into
 # artifacts, so they can be reused for job submission to hardware devices.
 python-test:
-  stage: build-for-tests 
+  stage: build-for-tests
   extends:
     - .use-debian/x86_64_pyutils
     - .build-common

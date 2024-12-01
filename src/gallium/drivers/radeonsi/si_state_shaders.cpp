@@ -925,8 +925,8 @@ void gfx9_get_gs_info(struct si_shader_selector *es, struct si_shader_selector *
 static void gfx9_set_gs_sgpr_num_es_outputs(struct si_context *sctx, unsigned esgs_vertex_stride)
 {
    /* The stride must always be odd (e.g. a multiple of 4 + 1) to reduce LDS bank conflicts. */
-   assert(esgs_vertex_stride % 4 == 1);
-   unsigned num_es_outputs = (esgs_vertex_stride - 1) / 4;
+   assert(!esgs_vertex_stride || esgs_vertex_stride % 4 == 1);
+   unsigned num_es_outputs = esgs_vertex_stride / 4;
 
    /* If there are no ES outputs, GS doesn't use this SGPR field, so only set it if the number
     * is non-zero.
@@ -2445,8 +2445,7 @@ void si_vs_ps_key_update_rast_prim_smooth_stipple(struct si_context *sctx)
       ps_key->ps.part.prolog.poly_stipple = rs->poly_stipple_enable;
       ps_key->ps.mono.poly_line_smoothing = rs->poly_smooth && sctx->framebuffer.nr_samples <= 1;
       ps_key->ps.mono.point_smoothing = 0;
-      ps_key->ps.opt.force_front_face_input = rs->force_front_face_input &&
-                                              ps->info.uses_frontface;
+      ps_key->ps.opt.force_front_face_input = ps->info.uses_frontface ? rs->force_front_face_input : 0;
    }
 
    if (vs_key->ge.opt.kill_pointsize != old_kill_pointsize ||

@@ -12,6 +12,7 @@
 #include "winsys/radeon_winsys.h"
 #include "util/u_blitter.h"
 #include "util/u_idalloc.h"
+#include "util/u_log.h"
 #include "util/u_suballoc.h"
 #include "util/u_threaded_context.h"
 #include "util/u_vertex_state_cache.h"
@@ -498,6 +499,7 @@ struct radeon_saved_cs {
 
 struct si_aux_context {
    struct pipe_context *ctx;
+   struct u_log_context log;
    mtx_t lock;
 };
 
@@ -510,13 +512,6 @@ struct si_screen {
    struct nir_shader_compiler_options *nir_options;
    uint64_t debug_flags;
    char renderer_string[183];
-
-   void (*make_texture_descriptor)(struct si_screen *screen, struct si_texture *tex, bool sampler,
-                                   enum pipe_texture_target target, enum pipe_format pipe_format,
-                                   const unsigned char state_swizzle[4], unsigned first_level,
-                                   unsigned last_level, unsigned first_layer, unsigned last_layer,
-                                   unsigned width, unsigned height, unsigned depth,
-                                   bool get_bo_metadata, uint32_t *state, uint32_t *fmask_state);
 
    unsigned pa_sc_raster_config;
    unsigned pa_sc_raster_config_1;
@@ -559,13 +554,21 @@ struct si_screen {
       struct {
          struct si_aux_context general;
 
+         /* Used by resource_create to clear/initialize memory.
+          *
+          * Note that there are no barriers around the clears, which enables parallelism between
+          * individual clears. If anything else uses this context, it should wait for idle before
+          * using any buffer/texture.
+          */
+         struct si_aux_context compute_resource_init;
+
          /* Second auxiliary context for uploading shaders. When the first auxiliary context is
           * locked and wants to compile and upload shaders, we need to use a second auxiliary
           * context because the first one is locked.
           */
          struct si_aux_context shader_upload;
       } aux_context;
-      struct si_aux_context aux_contexts[2];
+      struct si_aux_context aux_contexts[3];
    };
 
    /* Async compute context for DRI_PRIME copies. */
@@ -668,9 +671,6 @@ struct si_compute {
 
    unsigned ir_type;
    unsigned input_size;
-
-   int max_global_buffers;
-   struct pipe_resource **global_buffers;
 };
 
 struct si_sampler_view {
@@ -749,7 +749,7 @@ struct si_framebuffer {
 
 enum si_quant_mode
 {
-   /* This is the list we want to support. */
+   /* The small prim precision computation depends on the enum values to be like this. */
    SI_QUANT_MODE_16_8_FIXED_POINT_1_256TH,
    SI_QUANT_MODE_14_10_FIXED_POINT_1_1024TH,
    SI_QUANT_MODE_12_12_FIXED_POINT_1_4096TH,
@@ -1106,6 +1106,10 @@ struct si_context {
    bool bo_list_add_all_resident_resources;
    bool bo_list_add_all_compute_resources;
 
+   /* tracked buffers for OpenCL */
+   int max_global_buffers;
+   struct pipe_resource **global_buffers;
+
    /* other shader resources */
    struct pipe_constant_buffer null_const_buf; /* used for set_constant_buffer(NULL) on GFX7 */
    struct pipe_resource *esgs_ring;
@@ -1277,6 +1281,8 @@ struct si_context {
    unsigned num_decompress_calls;
    unsigned last_cb_flush_num_draw_calls;
    unsigned last_db_flush_num_draw_calls;
+   unsigned last_ps_sync_num_draw_calls;
+   unsigned last_vs_sync_num_draw_calls;
    unsigned last_cb_flush_num_decompress_calls;
    unsigned last_db_flush_num_decompress_calls;
    unsigned num_compute_calls;
@@ -1383,6 +1389,8 @@ void si_barrier_after_simple_buffer_op(struct si_context *sctx, unsigned flags,
                                        struct pipe_resource *dst, struct pipe_resource *src);
 void si_fb_barrier_before_rendering(struct si_context *sctx);
 void si_fb_barrier_after_rendering(struct si_context *sctx, unsigned flags);
+void si_barrier_before_image_fast_clear(struct si_context *sctx, unsigned types);
+void si_barrier_after_image_fast_clear(struct si_context *sctx);
 void si_init_barrier_functions(struct si_context *sctx);
 
 /* si_blit.c */
@@ -1465,7 +1473,7 @@ void si_init_buffer_clear(struct si_clear_info *info,
                           struct pipe_resource *resource, uint64_t offset,
                           uint32_t size, uint32_t clear_value);
 void si_execute_clears(struct si_context *sctx, struct si_clear_info *info,
-                       unsigned num_clears, unsigned types, bool render_condition_enabled);
+                       unsigned num_clears, bool render_condition_enabled);
 bool si_compute_fast_clear_image(struct si_context *sctx, struct pipe_resource *tex,
                                  enum pipe_format format, unsigned level, const struct pipe_box *box,
                                  const union pipe_color_union *color, bool render_condition_enable,
@@ -2020,11 +2028,6 @@ static inline bool util_prim_is_points_or_lines(unsigned prim)
 static inline bool util_rast_prim_is_triangles(unsigned prim)
 {
    return ((1 << prim) & UTIL_ALL_PRIM_TRIANGLE_MODES) != 0;
-}
-
-static inline bool util_rast_prim_is_lines_or_triangles(unsigned prim)
-{
-   return ((1 << prim) & (UTIL_ALL_PRIM_LINE_MODES | UTIL_ALL_PRIM_TRIANGLE_MODES)) != 0;
 }
 
 static inline void si_need_gfx_cs_space(struct si_context *ctx, unsigned num_draws)

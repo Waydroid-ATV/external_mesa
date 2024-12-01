@@ -298,7 +298,15 @@ i965_asm_set_instruction_options(struct brw_codegen *p,
 	}
 	brw_inst_set_debug_control(p->devinfo, brw_last_inst,
 			           options.debug_control);
-	if (p->devinfo->ver < 20) {
+	if (brw_has_branch_ctrl(p->devinfo, brw_inst_opcode(p->isa, brw_last_inst))) {
+		if (options.acc_wr_control)
+			error(NULL, "Instruction does not support AccWrEnable\n");
+
+		brw_inst_set_branch_control(p->devinfo, brw_last_inst,
+		                            options.branch_control);
+	} else if (options.branch_control) {
+		error(NULL, "Instruction does not support BranchCtrl\n");
+	} else if (p->devinfo->ver < 20) {
 		brw_inst_set_acc_wr_control(p->devinfo, brw_last_inst,
 					    options.acc_wr_control);
 	}
@@ -450,6 +458,9 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 /* thread control */
 %token ATOMIC SWITCH
 
+/* branch control */
+%token BRANCH_CTRL
+
 /* quater control */
 %token QTR_2Q QTR_3Q QTR_4Q QTR_2H QTR_2N QTR_3N QTR_4N QTR_5N
 %token QTR_6N QTR_7N QTR_8N
@@ -540,6 +551,7 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 %token <integer> REG_DIST_INT
 %token <integer> REG_DIST_LONG
 %token <integer> REG_DIST_ALL
+%token <integer> REG_DIST_MATH
 %token <integer> SBID_ALLOC
 %token <integer> SBID_WAIT_SRC
 %token <integer> SBID_WAIT_DST
@@ -577,6 +589,9 @@ add_instruction_option(struct options *options, struct instoption opt)
 		break;
 	case ATOMIC:
 		options->thread_control |= BRW_THREAD_ATOMIC;
+		break;
+	case BRANCH_CTRL:
+		options->branch_control = true;
 		break;
 	case NODDCHK:
 		options->no_dd_check = true;
@@ -2048,6 +2063,12 @@ depinfo:
 		$$.regdist = $1;
 		$$.pipe = TGL_PIPE_ALL;
 	}
+	| REG_DIST_MATH
+	{
+		memset(&$$, 0, sizeof($$));
+		$$.regdist = $1;
+		$$.pipe = TGL_PIPE_MATH;
+	}
 	| SBID_ALLOC
 	{
 		memset(&$$, 0, sizeof($$));
@@ -2084,6 +2105,7 @@ instoption:
 	| EOT 	        { $$.type = INSTOPTION_FLAG; $$.uint_value = EOT; }
 	| SWITCH 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = SWITCH; }
 	| ATOMIC 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = ATOMIC; }
+	| BRANCH_CTRL 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = BRANCH_CTRL; }
 	| CMPTCTRL 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = CMPTCTRL; }
 	| WECTRL 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = WECTRL; }
 	| QTR_2Q 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 8; }

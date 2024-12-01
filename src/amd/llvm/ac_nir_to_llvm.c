@@ -334,7 +334,8 @@ static LLVMValueRef emit_umul_high(struct ac_llvm_context *ctx, LLVMValueRef src
 {
    LLVMValueRef dst64, result;
 
-#if LLVM_VERSION_MAJOR < 20
+/* 64-bit multiplication by a constant is broken in old LLVM. Fixed in LLVM 19.1 and LLVM 20. */
+#if LLVM_VERSION_MAJOR < 19 || (LLVM_VERSION_MAJOR == 19 && LLVM_VERSION_MINOR == 0)
    if (LLVMIsConstant(src0))
       ac_build_optimization_barrier(ctx, &src1, false);
    else
@@ -2872,10 +2873,17 @@ emit_load_frag_coord(struct ac_nir_context *ctx)
 {
    LLVMValueRef values[4] = {
       ac_get_arg(&ctx->ac, ctx->args->frag_pos[0]), ac_get_arg(&ctx->ac, ctx->args->frag_pos[1]),
-      ac_get_arg(&ctx->ac, ctx->args->frag_pos[2]),
-      ac_build_fdiv(&ctx->ac, ctx->ac.f32_1, ac_get_arg(&ctx->ac, ctx->args->frag_pos[3]))};
+      ac_get_arg(&ctx->ac, ctx->args->frag_pos[2]), ac_get_arg(&ctx->ac, ctx->args->frag_pos[3])};
 
    return ac_to_integer(&ctx->ac, ac_build_gather_values(&ctx->ac, values, 4));
+}
+
+static LLVMValueRef
+emit_load_pixel_coord(struct ac_nir_context *ctx)
+{
+   LLVMValueRef value = ac_get_arg(&ctx->ac, ctx->args->pos_fixed_pt);
+
+   return LLVMBuildBitCast(ctx->ac.builder, value, ctx->ac.v2i16, "");
 }
 
 static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *instr)
@@ -2890,6 +2898,7 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
    case nir_intrinsic_ddx_coarse:
    case nir_intrinsic_ddy_coarse:
       result = emit_ddxy(ctx, instr->intrinsic, get_src(ctx, instr->src[0]));
+      result = ac_to_integer(&ctx->ac, result);
       break;
    case nir_intrinsic_ballot:
    case nir_intrinsic_ballot_relaxed:
@@ -3021,6 +3030,9 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
    case nir_intrinsic_load_frag_coord:
       result = emit_load_frag_coord(ctx);
       break;
+   case nir_intrinsic_load_pixel_coord:
+      result = emit_load_pixel_coord(ctx);
+      break;
    case nir_intrinsic_load_frag_shading_rate:
       result = emit_load_frag_shading_rate(ctx);
       break;
@@ -3151,7 +3163,7 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
       break;
    case nir_intrinsic_shared_atomic:
    case nir_intrinsic_shared_atomic_swap: {
-      LLVMValueRef ptr = get_memory_ptr(ctx, instr->src[0], 0);
+      LLVMValueRef ptr = get_memory_ptr(ctx, instr->src[0], nir_intrinsic_base(instr));
       result = visit_var_atomic(ctx, instr, ptr, 1);
       break;
    }
@@ -3466,8 +3478,11 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
       break;
    }
    case nir_intrinsic_is_subgroup_invocation_lt_amd: {
-      LLVMValueRef count = LLVMBuildAnd(ctx->ac.builder, get_src(ctx, instr->src[0]),
-                                        LLVMConstInt(ctx->ac.i32, 0xff, 0), "");
+      unsigned offset = nir_intrinsic_base(instr);
+      LLVMValueRef count = get_src(ctx, instr->src[0]);
+      if (offset)
+         count = LLVMBuildLShr(ctx->ac.builder, count, LLVMConstInt(ctx->ac.i32, offset, 0), "");
+      count = LLVMBuildAnd(ctx->ac.builder, count, LLVMConstInt(ctx->ac.i32, 0xff, 0), "");
       result = LLVMBuildICmp(ctx->ac.builder, LLVMIntULT, ac_get_thread_id(&ctx->ac), count, "");
       break;
    }

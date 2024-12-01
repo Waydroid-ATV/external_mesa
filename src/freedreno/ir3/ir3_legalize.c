@@ -466,7 +466,7 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
          else
             reg = n->srcs[i - n->dsts_count];
 
-         if (reg_gpr(reg)) {
+         if (is_reg_gpr(reg)) {
 
             /* TODO: we probably only need (ss) for alu
              * instr consuming sfu result.. need to make
@@ -598,7 +598,7 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
          list_addtail(&n->node, &block->instr_list);
       }
 
-      if (is_sfu(n))
+      if (is_sfu(n) || n->opc == OPC_SHFL)
          regmask_set(&state->needs_ss, n->dsts[0]);
 
       foreach_dst (dst, n) {
@@ -662,7 +662,7 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
           * (sy)... ; sam synced so consumed its sources
           * (ss)write rs ; (ss) unnecessary since rs has been consumed already
           */
-         bool needs_ss = is_ss_producer(n) || is_store(n);
+         bool needs_ss = is_ss_producer(n) || is_store(n) || n->opc == OPC_STC;
 
          if (n_is_scalar_alu) {
             /* Scalar ALU also does not immediately read its source because it
@@ -1721,8 +1721,7 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
 
          foreach_src (reg, instr) {
             if (in_preamble) {
-               if (!(reg->flags & (IR3_REG_IMMED | IR3_REG_CONST | IR3_REG_SHARED)) &&
-                   is_reg_gpr(reg))
+               if (!(reg->flags & IR3_REG_SHARED) && is_reg_gpr(reg))
                   gpr_in_preamble = true;
                if (reg->flags & IR3_REG_RELATIV)
                   relative_in_preamble = true;

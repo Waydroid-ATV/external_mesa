@@ -483,6 +483,9 @@ radv_enc_session_init(struct radv_cmd_buffer *cmd_buffer, const struct VkVideoEn
       radeon_emit(cs, 0); // slice output enabled.
    }
    radeon_emit(cs, vid->enc_session.display_remote);
+   if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_4) {
+      radeon_emit(cs, 0);
+   }
    ENC_END;
 }
 
@@ -519,8 +522,8 @@ radv_enc_slice_control(struct radv_cmd_buffer *cmd_buffer, const struct VkVideoE
    struct radeon_cmdbuf *cs = cmd_buffer->cs;
 
    uint32_t num_mbs_in_slice;
-   uint32_t width_in_mbs = enc_info->srcPictureResource.codedExtent.width / 16;
-   uint32_t height_in_mbs = enc_info->srcPictureResource.codedExtent.height / 16;
+   uint32_t width_in_mbs = DIV_ROUND_UP(enc_info->srcPictureResource.codedExtent.width, 16);
+   uint32_t height_in_mbs = DIV_ROUND_UP(enc_info->srcPictureResource.codedExtent.height, 16);
    num_mbs_in_slice = width_in_mbs * height_in_mbs;
    ENC_BEGIN;
    radeon_emit(cs, pdev->vcn_enc_cmds.slice_control_h264);
@@ -597,16 +600,11 @@ radv_enc_slice_control_hevc(struct radv_cmd_buffer *cmd_buffer, const struct VkV
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radeon_cmdbuf *cs = cmd_buffer->cs;
-   const struct VkVideoEncodeH265PictureInfoKHR *h265_picture_info =
-      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
-   const StdVideoEncodeH265PictureInfo *pic = h265_picture_info->pStdPictureInfo;
-   const StdVideoH265SequenceParameterSet *sps =
-      vk_video_find_h265_enc_std_sps(&cmd_buffer->video.params->vk, pic->pps_seq_parameter_set_id);
 
    uint32_t width_in_ctb, height_in_ctb, num_ctbs_in_slice;
 
-   width_in_ctb = sps->pic_width_in_luma_samples / 64;
-   height_in_ctb = sps->pic_height_in_luma_samples / 64;
+   width_in_ctb = DIV_ROUND_UP(enc_info->srcPictureResource.codedExtent.width, 64);
+   height_in_ctb = DIV_ROUND_UP(enc_info->srcPictureResource.codedExtent.height, 64);
    num_ctbs_in_slice = width_in_ctb * height_in_ctb;
    ENC_BEGIN;
    radeon_emit(cs, pdev->vcn_enc_cmds.slice_control_hevc);
@@ -947,7 +945,7 @@ radv_enc_slice_header_hevc(struct radv_cmd_buffer *cmd_buffer, const VkVideoEnco
    radv_enc_code_fixed_bits(cmd_buffer, 0x0, 1);
    radv_enc_code_fixed_bits(cmd_buffer, nal_unit_type, 6);
    radv_enc_code_fixed_bits(cmd_buffer, 0x0, 6);
-   radv_enc_code_fixed_bits(cmd_buffer, 0x1, 3);
+   radv_enc_code_fixed_bits(cmd_buffer, pic->TemporalId + 1, 3);
 
    radv_enc_flush_headers(cmd_buffer);
    instruction[inst_index] = RENCODE_HEADER_INSTRUCTION_COPY;
@@ -1364,6 +1362,7 @@ radv_enc_params(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInfoKHR *
    uint64_t chroma_va = va + src_img->planes[1].surface.u.gfx9.surf_offset;
    uint32_t pic_type;
    unsigned int slot_idx = 0xffffffff;
+   unsigned int max_layers = cmd_buffer->video.vid->rc_layer_control.max_num_temporal_layers;
 
    radv_cs_add_buffer(device->ws, cs, src_img->bindings[0].bo);
    if (h264_pic) {
@@ -1382,7 +1381,7 @@ radv_enc_params(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInfoKHR *
          pic_type = RENCODE_PICTURE_TYPE_I;
          break;
       }
-      radv_enc_layer_select(cmd_buffer, h264_pic->temporal_id);
+      radv_enc_layer_select(cmd_buffer, MIN2(h264_pic->temporal_id, max_layers));
    } else if (h265_pic) {
       switch (h265_pic->pic_type) {
       case STD_VIDEO_H265_PICTURE_TYPE_P:
@@ -1399,7 +1398,7 @@ radv_enc_params(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInfoKHR *
          pic_type = RENCODE_PICTURE_TYPE_I;
          break;
       }
-      radv_enc_layer_select(cmd_buffer, h265_pic->TemporalId);
+      radv_enc_layer_select(cmd_buffer, MIN2(h265_pic->TemporalId, max_layers));
    } else {
       assert(0);
       return;
@@ -1995,7 +1994,8 @@ radv_GetEncodedVideoSessionParametersKHR(VkDevice device,
             struct VkVideoEncodeH265SessionParametersFeedbackInfoKHR *h265_feedback_info =
                vk_find_struct(pFeedbackInfo->pNext, VIDEO_ENCODE_H265_SESSION_PARAMETERS_FEEDBACK_INFO_KHR);
             pFeedbackInfo->hasOverrides = VK_TRUE;
-            h265_feedback_info->hasStdPPSOverrides = VK_TRUE;
+            if (h265_feedback_info)
+               h265_feedback_info->hasStdPPSOverrides = VK_TRUE;
          }
       }
       total_size = sps_size + pps_size + vps_size;
